@@ -1,0 +1,10 @@
+work/
+data/capture/
+data/ghidra/code.bin
+data/ghidra/code.bin.c
+__pycache__/
+*.pyc
+*.cia
+*.3ds
+*.fa
+romfs/

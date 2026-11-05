@@ -1,0 +1,10 @@
+pc,service
+001339d8,dsp::DSP
+00133a24,dsp::DSP
+00133a54,dsp::DSP
+00134a9c,gsp::Gpu
+00134ae8,gsp::Gpu
+00134b3c,gsp::Gpu
+001380c4,dsp::DSP
+0013ba7c,gsp::Gpu
+00233f84,ndm:u
