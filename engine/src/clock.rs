@@ -1,22 +1,21 @@
-//! Relógio do jogo ligado ao relógio do PC (no 3DS ele é um contador próprio do jogo).
+//! Relógio do jogo: contador próprio do jogo, como no 3DS (não segue o relógio do PC).
 //!
 //! O que o `code.bin` faz (lido no export do Ghidra):
 //! - O relógio do jogo é um contador `u32` em `[DAT_005c69f8+0x10]+0xc`, em **terços de segundo**:
 //!   hora = t / 10800, minuto = (t / 180) % 60, segundo = (t / 3) % 60 (`FUN_002b3810`, usado por `op14041(i)`).
 //!   `op14041(3)` devolve 0 de dia (06:00–17:59) e 3 à noite; índices ≥ 4 devolvem o contador cru (`FUN_002b38f4`).
 //! - `op14040(h, m)` grava `h·10800 + m·180` (`FUN_002aec6c` → `FUN_002aec10`).
-//! - `FUN_00371b44` avança o contador a cada quadro (`+ dt·3`, volta a 0 depois das 23h) **exceto** com o flag
+//! - `FUN_00371b44` avança o contador a cada quadro (`+ dt·3`; passando de 23h volta a 0) **exceto** com o flag
 //!   `time_lock` (crc32 `0x2a329223`) ligado (`op14000('time_lock', 1)`).
 //!
-//! No port: a hora vem do relógio local do PC. Quando a história força uma hora (`op14040`, ex.: 19:30 antes de
-//! um evento noturno), ela vale a partir dali e anda em tempo real (congelada com `time_lock`) até o script soltar
-//! o `time_lock` (`op14000('time_lock', 0)`): aí volta a ser a hora do PC. [decisão do port, não do jogo]
-//! `YW_CLOCK=HH:MM` fixa uma hora de partida (testes / ver o jogo à noite de dia).
+//! No port (motor congelado): o contador anda em tempo real enquanto o jogo roda; novo jogo parte de 0 [H: valor
+//! inicial não medido — a história ajusta com `op14040`]. A data do diário (`op12055`) continua vindo do relógio do
+//! sistema, como o RTC do console.
 
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Data/hora local do PC.
+/// Data/hora local do sistema (equivale ao RTC do console; usada só na data do diário).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalTime {
     pub year: u16,
@@ -109,54 +108,48 @@ pub fn local_now() -> LocalTime {
 
 const DAY_UNITS: u32 = 24 * 10800;
 
-/// Hora forçada pela história: (contador no momento, instante, congelada?).
-struct Forced {
-    units: u32,
-    since: Instant,
-    frozen: bool,
-}
-
 struct State {
-    forced: Option<Forced>,
+    units: u32,
+    since: Option<Instant>,
     lock: bool,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    forced: None,
+    units: 0,
+    since: None,
     lock: false,
 });
 
-fn units_of(h: u32, m: u32, s: u32) -> u32 {
-    (h * 10800 + m * 180 + s * 3) % DAY_UNITS
+fn units_of(h: u32, m: u32) -> u32 {
+    (h * 10800 + m * 180) % DAY_UNITS
 }
 
-fn env_start() -> Option<u32> {
-    let v = std::env::var("YW_CLOCK").ok()?;
-    let (h, m) = v.trim().split_once(':')?;
-    Some(units_of(h.parse().ok()?, m.parse().ok()?, 0))
-}
-
-fn pc_units() -> u32 {
-    let t = local_now();
-    units_of(t.hour as u32, t.minute as u32, t.second as u32)
+/// Aplica o tempo decorrido desde a última leitura (`FUN_00371b44`).
+fn advance(st: &mut State) {
+    let now = Instant::now();
+    if let Some(t0) = st.since {
+        if !st.lock {
+            let add = (now.duration_since(t0).as_secs_f64() * 3.0) as u32;
+            if add > 0 {
+                st.units = st.units.wrapping_add(add);
+                if st.units / 10800 > 23 {
+                    st.units = 0;
+                }
+                // guarda a fração que sobrou
+                st.since = Some(t0 + std::time::Duration::from_secs_f64(add as f64 / 3.0));
+                return;
+            }
+            return;
+        }
+    }
+    st.since = Some(now);
 }
 
 /// Contador do relógio do jogo (terços de segundo desde 00:00).
 pub fn game_units() -> u32 {
-    let st = STATE.lock().unwrap();
-    match &st.forced {
-        Some(f) if f.frozen => f.units,
-        Some(f) => (f.units + (f.since.elapsed().as_secs_f64() * 3.0) as u32) % DAY_UNITS,
-        None => match env_start() {
-            Some(u) => {
-                // YW_CLOCK: parte da hora pedida e anda junto com o processo
-                static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-                let t0 = *START.get_or_init(Instant::now);
-                (u + (t0.elapsed().as_secs_f64() * 3.0) as u32) % DAY_UNITS
-            }
-            None => pc_units(),
-        },
-    }
+    let mut st = STATE.lock().unwrap();
+    advance(&mut st);
+    st.units
 }
 
 /// `op14041(i)`: 0 hora, 1 minuto, 2 segundo, 3 período (0 dia, 3 noite), ≥4 contador cru.
@@ -177,47 +170,29 @@ pub fn query(i: i32) -> i32 {
     }) as i32
 }
 
-/// `op14040(h, m)`: a história força uma hora.
+/// `op14040(h, m)`
 pub fn set_game_time(h: i32, m: i32) {
     let mut st = STATE.lock().unwrap();
-    let frozen = st.lock;
-    st.forced = Some(Forced {
-        units: units_of(h.max(0) as u32, m.max(0) as u32, 0),
-        since: Instant::now(),
-        frozen,
-    });
+    st.units = units_of(h.max(0) as u32, m.max(0) as u32);
+    st.since = Some(Instant::now());
 }
 
-/// `op14000('time_lock', v)`: 1 congela; 0 solta e volta à hora do PC.
+/// `op14000('time_lock', v)`: 1 congela, 0 volta a andar.
 pub fn set_lock(on: bool) {
     let mut st = STATE.lock().unwrap();
+    advance(&mut st);
     st.lock = on;
-    if on {
-        let now = match &st.forced {
-            Some(f) if f.frozen => f.units,
-            Some(f) => (f.units + (f.since.elapsed().as_secs_f64() * 3.0) as u32) % DAY_UNITS,
-            None => {
-                drop(st);
-                let u = game_units();
-                st = STATE.lock().unwrap();
-                u
-            }
-        };
-        st.forced = Some(Forced {
-            units: now,
-            since: Instant::now(),
-            frozen: true,
-        });
-    } else {
-        st.forced = None;
-    }
+    st.since = Some(Instant::now());
 }
 
-/// Volta à hora do PC (novo jogo / carregar diário: a hora forçada não é salva).
+/// Novo jogo: contador em 0, destravado.
 pub fn reset() {
     let mut st = STATE.lock().unwrap();
-    st.forced = None;
-    st.lock = false;
+    *st = State {
+        units: 0,
+        since: Some(Instant::now()),
+        lock: false,
+    };
 }
 
 #[cfg(test)]
@@ -225,28 +200,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clock_follows_pc_and_story_overrides() {
+    fn game_clock_is_the_games_own_counter() {
         reset();
+        assert_eq!(query(0), 0);
         let pc = local_now();
         assert!((1..=12).contains(&pc.month) && (1..=31).contains(&pc.day) && pc.year >= 2024);
-        if std::env::var("YW_CLOCK").is_err() {
-            let h = query(0);
-            assert!(h == pc.hour as i32 || h == (pc.hour as i32 + 1) % 24);
-        }
         // a história força 19:30 → noite
         set_game_time(19, 30);
         assert_eq!((query(0), query(1), query(3)), (19, 30, 3));
         // congelada com time_lock
         set_lock(true);
-        assert_eq!(query(0), 19);
         set_game_time(7, 30);
-        assert_eq!(
-            (query(0), query(1), query(3), query(4)),
-            (7, 30, 0, 7 * 10800 + 30 * 180)
-        );
-        // soltar o time_lock devolve a hora do PC
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!((query(0), query(1), query(3), query(4)), (7, 30, 0, 7 * 10800 + 30 * 180));
+        // destravada, anda 3 unidades por segundo
         set_lock(false);
-        assert!(STATE.lock().unwrap().forced.is_none());
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert!(query(4) >= 7 * 10800 + 30 * 180 + 2);
+        // passou de 23:59 → 0
+        set_game_time(23, 59);
+        STATE.lock().unwrap().units = DAY_UNITS - 1;
+        STATE.lock().unwrap().since = Some(Instant::now() - std::time::Duration::from_secs(1));
+        assert_eq!(query(0), 0);
         reset();
     }
 }

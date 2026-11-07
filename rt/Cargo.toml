@@ -1,0 +1,8 @@
+[package]
+name = "yw1-rt"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime do código ARM recompilado do Yo-kai Watch 1: estado da CPU, memória guest e semântica das instruções"
+publish = false
+
+[dependencies]

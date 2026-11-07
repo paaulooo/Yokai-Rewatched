@@ -4,6 +4,22 @@ Meta declarada pelo usuário: *"readaptar o jogo para que seja rodável nativame
 o processo**. Estratégia: (1) entender o jogo (arquivos, serviços, GPU); (2) reimplementar o que o 3DS fornece (HLE de serviços
 + renderizador PICA) ; (3) recompilar/portar o código ARM (`code.bin`).
 
+## ★ Recompilação estática (2026-11-07) — ver docs/RECOMP.md
+O rumo do projeto mudou: o jogo agora roda o **próprio código ARM recompilado para Rust** (`recomp/` → `work/recomp/`),
+com HLE do 3DS (`engine/src/hle/`) e renderizador PICA próprio (`engine/src/pica/`).
+- Medido: 18.376 funções, 1,31 milhão de instruções traduzidas, build do código gerado em ≈2–8 min.
+- O jogo passa pelo boot real, pela tela LOADING, pelo **vídeo do logo da Level-5** e pela **abertura**, com
+  legendas e dois quadros de tela. Isso em 60 s sem janela e sem cair, a 59,8 VBlanks/s.
+- O renderizador por software reproduz o quadro capturado do quarto com **98,8%** dos pixels iguais ao Azahar.
+- O motor manual (seção abaixo, executável `yw1`) está **congelado**.
+
+Próximos passos, em ordem:
+1. janela (winit) e entrada → HID;
+2. backend Vulkan (principal) e DX12;
+3. áudio HLE do DSP;
+4. desempenho do renderizador `soft`;
+5. comparação tela a tela com o Azahar (`tools/azahar_rpc.py`, `tools/img_diff.py`).
+
 ## Feito (verificado)
 | Área | Resultado | Onde |
 |---|---|---|
@@ -144,10 +160,11 @@ Fluxo jogável: título → New Game → diário (2111) → menino/menina (2060)
   persistidas em `settings.ini` (`game_options`); volume da música do jogo aplicado.
 * **Nome**: digitado pelo teclado do PC na tela 2070 (até 8 letras, Backspace apaga, Enter confirma).
 
-## Relógio do PC (2026-11-06)
-- O relógio do jogo (`op14041`, usado pelos relógios de parede dos mapas e por dia/noite) agora segue a hora local
-  do PC; a data do diário (`op12055`, tela de salvar/carregar) é a do PC no momento em que se salva (`saved_at` no
-  `.ini`). Formato e regras em `FORMATS.md` § "Relógio do jogo". Teste: `clock_follows_pc_and_story_overrides`.
+## Relógio do jogo (2026-11-06; revertido em 2026-11-07)
+- O relógio do jogo (`op14041`, relógios de parede e dia/noite) é o contador próprio do jogo, como no 3DS (anda em
+  tempo real, `op14040` ajusta, `time_lock` congela). A ligação com a hora do PC foi removida a pedido do Paulo.
+  A data do diário (`op12055`) continua sendo a do sistema no momento em que se salva (equivale ao RTC do console).
+  Teste: `game_clock_is_the_games_own_counter`.
 - Ainda não há variação visual dia/noite nos mapas (iluminação/variantes noturnas) — só a hora já está disponível.
 
 ## Reatribuição de texturas (2026-11-06)
@@ -174,7 +191,7 @@ Fluxo jogável: título → New Game → diário (2111) → menino/menina (2060)
   layouts de batalha, música `M25_battle01`. Teste: `tutorial_battle_is_won`; imagem: `battle_snapshot` (ignorado).
 - `engine/src/chapter1.rs`: 30 passos do capítulo 1 (18 eventos pelo script real com as conversas `EventTalkRun`,
   teleportes dos scripts de fase, Cadin entra → tutorial contra Buhu → Cadin sai → Buhu entra no time → salva) e o
-  jogo livre: segurar Y parado no Mt. Wildwood/rua procura Yo-kai pelas tabelas reais (período = relógio do PC,
+  jogo livre: segurar Y parado no Mt. Wildwood/rua procura Yo-kai pelas tabelas reais (período = relógio do jogo,
   relógio rank E), vitória pode trazer amizade. Teste: `chapter1_reaches_free_play` (ignorado, ≈21 mil ticks).
 - Save: `party`, `money`, `chapter`. `YW_START=chapter1` / `YW_START=wild` para testar.
 - [H] ainda: fórmula de dano, velocidade, chance de amizade, posições/câmera da batalha, os 8 pontos de busca

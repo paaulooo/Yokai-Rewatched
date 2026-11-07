@@ -5,10 +5,21 @@ edition = "2021"
 description = "Runtime nativo (PC) do Yo-kai Watch 1 (3DS) — usa os assets do RomFS do próprio usuário"
 publish = false
 
+[lib]
+name = "yw1"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yw1"
+path = "src/main.rs"
+
 [dependencies]
+yw1-rt = { path = "../rt" }
 minifb = "0.27"
 cpal = "0.15"
 gilrs = "0.11"
+# backend Vulkan do renderizador PICA (engine/src/render/vulkan.rs)
+ash = "0.38"
 
 [profile.dev]
 opt-level = 1

@@ -165,7 +165,7 @@ Textos de menu: `op13733(tabela, #chave)` → `data/res/text/menu/<tabela>_en.cf
 - `op12055(slot, i)` (`FUN_003fb1cc`): data em que o diário foi gravado — `u16` ano, `u8` mês, dia, hora, minuto.
 - **Port** (`engine/src/clock.rs`): a hora vem do relógio local do PC (`GetLocalTime`); hora forçada pela história
   (`op14040`) vale até `time_lock` ser solto ou até novo jogo/carregar; a data do diário é a do PC ao salvar.
-  `YW_CLOCK=HH:MM` fixa a hora de partida. [a regra da hora forçada é decisão do port]
+  O contador é do próprio jogo (anda enquanto o jogo roda, `op14040` ajusta); não segue o relógio do PC.
 
 ## Yo-kai, batalha e encontros (validado contra os dados; layout dos registros conferido com o Albatross de Tiniifan)
 - `data/res/character/chara_param_0.02.cfg.bin` `CHARA_PARAM_INFO`: 0 param · 1 base · 2 tribo · 3..7 HP/FOR/ESP/DEF/VEL ·

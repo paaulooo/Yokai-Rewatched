@@ -1,0 +1,11 @@
+[package]
+name = "yw1-recomp"
+version = "0.1.0"
+edition = "2021"
+description = "Recompilador estático do code.bin (ARM11/ARMv6K + VFPv2) do Yo-kai Watch 1 para Rust"
+publish = false
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

@@ -32,14 +32,23 @@ yokai-port/
   work/        TUDO que é gerado (fa_out, xi_png, model_out, texdump...) — não versionar
 ```
 
-## Runtime (Rust, dentro de `engine/`)
+## Recompilação estática (rumo atual — docs/RECOMP.md)
+```
+cd recomp && cargo run --release                         # gera work/recomp/ a partir de data/ghidra/code.bin
+cd work/recomp && cargo build --release -p yw1-recomp-app # executável yw1r (código do jogo + HLE + PICA)
+YW_HEADLESS_SECS=60 work/recomp/target/release/yw1r.exe   # sem janela; telas em work/recomp_frames/
+cd engine && cargo test --release --lib -- --ignored pica_frame --nocapture   # renderizador vs captura do Azahar
+```
+Código gerado = derivado do jogo → só em `work/`, nunca versionar. O motor manual abaixo está congelado.
+
+## Runtime manual antigo (Rust, dentro de `engine/`, congelado)
 ```
 cargo run --release [-- caminho/do/romfs]   # acha BASE/romfs/0004000000167700 sozinho; YW_ROMFS / YW_FFMPEG sobrescrevem
 YW_START=title cargo run --release           # pula os vídeos e vai direto ao menu de título
 YW_START=newgame cargo run --release         # New Game pelos scripts reais: slot → menino/menina → nome (Start) → quarto
 X no campo = menu principal (B fecha) · nome digitado no teclado (Enter confirma) · Start pula a cutscene
 F5 no campo = salvar no diário · saves em %APPDATA%/yw1/saves (YW_SAVES sobrescreve)
-Hora do jogo = relógio do PC (YW_CLOCK=HH:MM fixa outra hora de partida, p/ testar a noite)
+Hora do jogo = contador próprio do jogo (como no 3DS; não segue o relógio do PC)
 YW_START=chapter1 / wild cargo run --release  # capítulo 1 do pé da escada / Mt. Wildwood livre (Y parado = lente)
 Batalha: L/R gira o anel, ↑/↓ alvo, A Soultimate (gauge cheio), Y purificar, B fugir
 YW_START=room cargo run --release            # novo jogo direto no prólogo → quarto 3D (t101i02); F1/F2 = resolução interna do 3D (salva em settings.ini)
