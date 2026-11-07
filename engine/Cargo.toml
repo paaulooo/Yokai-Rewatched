@@ -1,0 +1,17 @@
+[package]
+name = "yw1"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime nativo (PC) do Yo-kai Watch 1 (3DS) — usa os assets do RomFS do próprio usuário"
+publish = false
+
+[dependencies]
+minifb = "0.27"
+cpal = "0.15"
+gilrs = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3

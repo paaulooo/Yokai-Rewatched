@@ -20,7 +20,8 @@ Dono: Paulo (usuário "dreavy", São Paulo). **Responda sempre em português do 
 yokai-port/
   CLAUDE.md  README.md
   docs/        STATUS.md (comece aqui) · FORMATS.md · GPU-PICA.md · IPC-SERVICES.md · ENVIRONMENT.md · img/
-  tools/       scripts Python (paths.py centraliza caminhos; sobrescreva com YW_* )
+  engine/      RUNTIME DO JOGO em Rust (crate `yw1`): janela 2 telas, boot (logo → abertura → menu), áudio BCSTM
+  tools/       scripts Python de extração/análise (paths.py centraliza caminhos; sobrescreva com YW_* )
   gdb/         scripts GDB para o stub do Azahar (captura de IPC e de quadros)
   data/
     ipc/       inventário dos 276 sites SendSyncRequest, mapa função→serviço, nomes confirmados
@@ -31,12 +32,32 @@ yokai-port/
   work/        TUDO que é gerado (fa_out, xi_png, model_out, texdump...) — não versionar
 ```
 
-## Comandos principais (rodar de dentro de `tools/`)
+## Runtime (Rust, dentro de `engine/`)
+```
+cargo run --release [-- caminho/do/romfs]   # acha BASE/romfs/0004000000167700 sozinho; YW_ROMFS / YW_FFMPEG sobrescrevem
+YW_START=title cargo run --release           # pula os vídeos e vai direto ao menu de título
+YW_START=newgame cargo run --release         # New Game pelos scripts reais: slot → menino/menina → nome (Start) → quarto
+X no campo = menu principal (B fecha) · nome digitado no teclado (Enter confirma) · Start pula a cutscene
+F5 no campo = salvar no diário · saves em %APPDATA%/yw1/saves (YW_SAVES sobrescreve)
+Hora do jogo = relógio do PC (YW_CLOCK=HH:MM fixa outra hora de partida, p/ testar a noite)
+YW_START=chapter1 / wild cargo run --release  # capítulo 1 do pé da escada / Mt. Wildwood livre (Y parado = lente)
+Batalha: L/R gira o anel, ↑/↓ alvo, A Soultimate (gauge cheio), Y purificar, B fugir
+YW_START=room cargo run --release            # novo jogo direto no prólogo → quarto 3D (t101i02); F1/F2 = resolução interna do 3D (salva em settings.ini)
+cargo test --release                         # BCSTM vs ffmpeg, CRC32, layouts do título
+cargo test --release -- --ignored            # gera snapshots/compara IMGC com tools/imgc.py (precisa de work/title/)
+```
+Controles (detalhes em `engine/src/input.rs`): teclado (setas/WASD, Z/Espaço = A, X/Backspace = B, Enter = Start,
+Esc sai), mouse na tela de baixo = toque, gamepads Xbox/PS/Switch/genéricos via `gilrs` com "confirmar" no botão de
+baixo (`YW_PAD_LAYOUT=nintendo` inverte para o layout do 3DS). Inspecionar o menu sem janela: os testes `--ignored`
+renderizam pelo mesmo código do runtime (não usar captura de tela — pode pegar outras janelas do usuário).
+
+## Comandos principais de extração (Python, rodar de dentro de `tools/`)
 ```
 python build_assets.py            # .fa -> arquivos -> PNG -> OBJ (≈2 min, ≈1 GB em work/)
 python fa_list.py [--extract]     # indice do yw1_a.fa (+ extrai)
 python frame_sim.py               # simula 1 quadro capturado: 1 linha por draw (textura, nº de vértices)
 python pica_decode.py LISTA.bin [--all]   # decodifica uma lista de comandos PICA
+python xq32_disasm.py --fa seq/menu/TitleMenu.xq   # desmonta um script XQ32 direto do .fa
 python imgc_validate.py           # (opcional) compara .xi com o dump do Azahar
 ```
 Variáveis: `YW_BASE, YW_FA, YW_CAP, YW_WORK, YW_DUMPTEX, YW_VRAM` (ver `tools/paths.py`).
@@ -48,6 +69,8 @@ Variáveis: `YW_BASE, YW_FA, YW_CAP, YW_WORK, YW_DUMPTEX, YW_VRAM` (ver `tools/p
 3. Binários grandes não vão por anexo de chat (a conversão corrompe); use a pasta/zip.
 4. Scripts devem rodar de qualquer pasta (use `paths.py`). Saídas geradas só em `work/`.
 5. Conteúdo do jogo (texturas, malhas, `.fa`) é do usuário e **nunca** deve ser commitado/publicado.
+6. **O jogo em si (runtime, renderizador, HLE, áudio/vídeo) é escrito em Rust** (`engine/`), por desempenho.
+   Python é só para extração, análise e protótipos de validação — nada de runtime em Python.
 
 ## Estado e próximos passos
 Leia `docs/STATUS.md`. Resumo: formatos de arquivos (ARC0, XPCK, IMGC, XMPR) e texturas/vértices do PICA estão decifrados;

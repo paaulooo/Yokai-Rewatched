@@ -46,3 +46,9 @@ gdb-multiarch -x ../../gdb/dump_frame2.gdb        # -> ./cap/ (linear.bin, vram_
 ## Notas para a recompilação ARM (fase futura)
 CPU alvo: ARM11 MPCore (ARMv6K) em **modo ARM** (nenhum site `svc` em Thumb). VFPv2. TLS em `TLS+0x80` para IPC. Syscalls via `svc` (0x32 = SendSyncRequest,
 outros: ver 3dbrew "SVC"). O jogo é C++ com vtables ("(**(code **)(*param_1 + 8))(param_1)"); `.cro` (módulos) são carregados via `ldr:ro` — **ainda não extraídos do RomFS** (não vistos no `.fa`).
+
+## REA (reverse-engineer-anything) com o code.bin
+* Ghidra 12.1.4 em `yokai-port/ghidra_12.1.4_PUBLIC/` (fora do git). O registro MCP do REA em `~/.claude.json` recebeu
+  `GHIDRA_INSTALL_DIR` (essa pasta) e `JAVA_HOME` (JDK 21); backup em `~/.claude.json.bak-rea`. Requer reiniciar o Claude Code.
+* No Windows o REA só aceita PE: `python tools/codebin_pe.py` gera `work/code_arm.exe` (PE ARMNT 0x01C4 com os endereços reais).
+  Validado: `rea decompile work/code_arm.exe 0x329bc8` = mesmo pseudocódigo do `code.bin.c`.

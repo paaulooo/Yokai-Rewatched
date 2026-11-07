@@ -87,7 +87,63 @@ Teste mínimo de ambiente: `tools/vk_min_test.py` confirma que o Vulkan 1.4 do d
 instância/device/fila/command pool sem erro nesta máquina (via binding Python `vulkan`, não precisa de compilador
 C/C++ instalado ainda).
 
-Próximo passo: 1) ler `VSH_OUTMAP_*` real da captura para confirmar a que semântica cada `o0..o6` corresponde
-(hoje é HIPÓTESE: o0=posição, o1=cor, o2/o3=UV, o4=? , o5=normal transformado, o6=specular/rim); 2) instalar
-toolchain C/C++ + `glslang`/`shaderc` (MSYS2 `pacman`) para compilar os `.vert` gerados para SPIR-V; 3) montar o
-pipeline mínimo em Vulkan (swapchain + 1 draw) e comparar contra `docs/img/rt480_final.png`.
+**`VSH_OUTMAP_*` real da captura: semântica de `o0..o6` CONFIRMADA** (não é mais hipótese). Lido com
+`tools/pica_decode.py ... --all` nos `data/capture/cap/list_02.bin` etc. (regs 0x04f/0x050-0x056). Tabela de semântica
+por índice de byte (confirmada cruzando os valores reais contra o enum `Semantic` do PICA200 usado pelo Citra —
+`0x1f`=não usado):
+```
+0x00-0x03 Position.x/y/z/w        0x0c/0x0d TexCoord0.u/v     0x12/0x13/0x14 View.x/y/z
+0x04-0x07 Quaternion(normquat)    0x0e/0x0f TexCoord1.u/v     0x16/0x17 TexCoord2.u/v
+  .x/y/z/w                        0x10      TexCoord0.w       0x1f      não usado
+0x08-0x0b Color.r/g/b/a
+```
+Caso real com 7 saídas (`SH_OUTMAP_TOTAL=7`, o shader maior visto no quadro):
+`o0`=posição(xyzw) · `o1`=cor(rgba) · `o2`=UV0.u,UV0.v,UV0.w,— · `o3`=UV1.u,UV1.v,—,— ·
+`o4`=UV2.u,UV2.v,—,— · `o5`=view.x,view.y,view.z,— · `o6`=quaternion(normquat).x,y,z,w.
+Ou seja: **não há "specular/rim" separado** — `o6` é o quaternion de orientação (usado para reconstruir a normal
+no fragment shader, como o `normquat` do Citra) e `o5` é o vetor de visada (`view`), ambos consumidos só no pixel
+shader (que ainda não foi capturado/desmontado). Caso simples com 4 saídas usa só `o0..o3` (posição, cor, UV0, UV1).
+
+**`glslang`/`shaderc` instalados** (MSYS2 UCRT64: `mingw-w64-ucrt-x86_64-glslang` 16.6.0, `mingw-w64-ucrt-x86_64-shaderc`
+2026.4) e **os 7 `.vert` gerados por `tools/pica_shader_to_glsl.py` compilam para SPIR-V sem erro** com
+`glslangValidator.exe -S vert -V` (`work/shaders/*.spv`), validados também com `spirv-val.exe`. Ex.: `prog3` (skinning,
+89 instruções PICA → 639 SPIR-V) valida limpo, com `v0/v1/v2/v7/v8` (atributos), `r1..r9` (temporários),
+`o0..o6` (saídas), `a0x/a0y/aL` (endereçamento relativo do skinning) todos presentes no módulo.
+
+**Uniforms float (`c[0..95]`) decodificados e validados**: `tools/pica_uniforms.py` lê `VSH_FLOATUNIFORM_*`
+(regs 0x2c0=index/modo, 0x2c1=dados) da captura real. Dois formatos confirmados contra dados reais (não hipótese):
+* **float32**: 4 palavras IEEE754 diretas = um vec4 (x,y,z,w).
+* **float24** (1 sinal + 7 expoente[bias 63] + 16 mantissa, bits 23..0 de cada componente): a escala usada pelo
+  PICA para constantes "baratas". O valor escalar bate exatamente com `VIEWPORT_WIDTH/HEIGHT` reais (`0x46e000`→240.0,
+  `0x469000`→200.0). O empacotamento de um **vec4** float24 em 3 palavras de 32 bits foi decifrado por força bruta
+  contra uniforms reais da captura: concatenando as 3 palavras (`palavra2<<64 | palavra1<<32 | palavra0`) e extraindo
+  4 campos de 24 bits a partir do LSB (ordem x,y,z,w), o uniform `c[91]` real decodifica para `(0,1,2,3)` — inteiros
+  limpos — e `c[92]` para `(0.125, 1/256, 0.5, 0.25)` — frações em potência de 2. Essa limpeza praticamente descarta
+  ordem/alinhamento errados (valores "feios" apareceriam com a ordem errada). `c[91].y=1` bate com o uso no shader
+  (`r5.w=c[91].y`, forçado para 1.0 = coordenada homogênea).
+
+**Achado em aberto (não escondido, documentado)**: para o draw 0 da captura (quad de 4 vértices, o mais simples do
+quadro), os uniforms REAIS capturados no momento do draw, rodados pela matemática real de `prog0`
+(`work/shaders/prog0_0x0000_0x001c.vert`), produzem um resultado degenerado — a matriz "mundo" real (`c[8..10]`)
+tem a primeira coluna zerada, ou seja **ignora `v0.x` completamente**, colapsando os 4 vértices no mesmo ponto.
+Isso indica que a correspondência exata "qual dos 7 programas (`prog0..prog6`) roda em qual draw" (via
+`VSH_ENTRYPOINT`, reg 0x2ba) ainda **não está validada** — o registrador lido para este draw veio com um valor fora
+do intervalo da memória de código do shader (`0x7fff0000`; memória tem só 512 palavras), sinal de que o rastreio do
+entry point real ainda está incompleto/errado. **Não foi assumido como fato**: ver próximo passo 1 abaixo.
+
+**Pipeline mínimo em Vulkan FUNCIONANDO** (`tools/vk_render_min.py`): renderiza off-screen (512×240, sem
+swapchain/janela) usando o SPIR-V real de `prog0` (o mesmo `.spv` compilado acima), posições e índices REAIS do
+draw 0 da captura, e um fragment shader mínimo que só repassa a cor interpolada. Como os uniforms reais de `prog0`
+para este draw são degenerados (achado acima), os uniforms foram substituídos por uma matriz ortográfica construída
+à mão (mundo=view=identidade, projeção linear 512×240→NDC) só para validar o lado Vulkan/SPIR-V — deixado explícito
+no código, não apresentado como "bateu com o jogo". Resultado: `work/shaders/vk_render_min.png`, quad vermelho
+preenchendo a imagem inteira exatamente como esperado pela matriz de teste — confirma que
+`shader_code.bin → desmontador → GLSL → SPIR-V → Vulkan → rasterização → leitura da imagem` funciona de ponta a
+ponta com o shader real traduzido e geometria real da captura.
+
+Próximo passo: 1) resolver a correspondência real draw→programa de shader (rastrear `VSH_ENTRYPOINT`/
+`VSH_CODETRANSFER_*` corretamente, possivelmente olhando listas anteriores à janela de 7 listas capturada) para
+poder usar os uniforms REAIS (não a matriz de teste) e comparar pixel a pixel contra `docs/img/rt480_final.png`;
+2) capturar e desmontar o 2º shader maior (1323 palavras) visto no quadro; 3) mapear `TEXENV_*` (combinação fixa de
+texturas, faz o papel de "fragment shader" no PICA200 — não há pixel shader programável clássico); 4) adicionar
+sampling de textura real ao pipeline Vulkan (hoje só repassa cor, sem `VkImage`/sampler).

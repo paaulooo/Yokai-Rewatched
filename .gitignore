@@ -8,3 +8,6 @@ __pycache__/
 *.3ds
 *.fa
 romfs/
+engine/target/
+# Ghidra local (ferramenta, não versionar)
+ghidra_*_PUBLIC/
