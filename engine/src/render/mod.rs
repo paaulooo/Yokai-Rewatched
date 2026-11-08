@@ -4,12 +4,13 @@
 //! — recorte nos 7 planos (`raster::clip`), projeção com o viewport do PICA arredondada a 1/16 de pixel (12.4) e o
 //! descarte por orientação — e empacota os uniforms do "ubershader" de fragmento (TEV, alpha test, texturas).
 //!
-//! Seleção: `YW_RENDERER=vulkan|soft|none` (padrão `soft`). Se o Vulkan não inicializar, cai para `soft` com aviso.
+//! Seleção: `YW_RENDERER=vulkan|soft|none` (padrão `vulkan`, desde 08/11, depois da revisão). Se o Vulkan não inicializar, cai para `soft` com aviso.
 //! O DX12 (alternativa futura) vai consumir os mesmos `GpuVtx` / `DrawUniforms`.
 //!
 //! Memória guest continua sendo a fonte da verdade: o backend carrega os render targets da memória quando mudaram e
 //! devolve o resultado para ela no fim de cada lista de comandos com draws (`end_list`).
 
+pub mod convert;
 pub mod vulkan;
 
 use crate::pica::raster::{self, Ctx, Vtx};
@@ -25,25 +26,35 @@ pub enum Backend {
 /// 0 = ainda não escolhido, 1 soft, 2 vulkan, 3 none
 static BACKEND: AtomicU8 = AtomicU8::new(0);
 
+// `code` e `decode` são a MESMA tabela, nos dois sentidos. Já estiveram invertidas (gravava Vulkan = 1 e lia 1 como
+// Soft): com o padrão soft, `backend()` passava a devolver Vulkan sem dispositivo e nada era desenhado. O teste
+// `backend_code_roundtrip` trava isso.
 fn code(b: Backend) -> u8 {
     match b {
-        Backend::Vulkan => 1,
-        Backend::Soft => 2,
+        Backend::Soft => 1,
+        Backend::Vulkan => 2,
         Backend::None => 3,
+    }
+}
+
+fn decode(c: u8) -> Option<Backend> {
+    match c {
+        1 => Some(Backend::Soft),
+        2 => Some(Backend::Vulkan),
+        3 => Some(Backend::None),
+        _ => None,
     }
 }
 
 /// Backend em uso (escolhido na primeira chamada por `YW_RENDERER`).
 pub fn backend() -> Backend {
-    match BACKEND.load(Ordering::Relaxed) {
-        1 => Backend::Soft,
-        2 => Backend::Vulkan,
-        3 => Backend::None,
-        _ => {
+    match decode(BACKEND.load(Ordering::Relaxed)) {
+        Some(b) => b,
+        None => {
             let want = match std::env::var("YW_RENDERER").as_deref() {
                 Ok("none") => Backend::None,
-                Ok("vulkan") | Ok("vk") => Backend::Vulkan,
-                Ok("soft") | Err(_) => Backend::Soft,
+                Ok("vulkan") | Ok("vk") | Err(_) => Backend::Vulkan,
+                Ok("soft") => Backend::Soft,
                 Ok(o) => {
                     eprintln!("[render] YW_RENDERER={o} desconhecido; usando soft");
                     Backend::Soft
@@ -74,10 +85,32 @@ pub fn set_backend(b: Backend) -> Backend {
     got
 }
 
-/// Fim de uma lista de comandos que desenhou: o backend de GPU devolve os render targets para a memória guest.
+/// Alguém (GSP) vai ler `[lo, hi)` da memória guest: o backend de GPU devolve antes o que só está nele.
+pub fn before_read(lo: u32, hi: u32) {
+    if backend() == Backend::Vulkan {
+        crate::pica::timed(3, || vulkan::before_read(lo, hi));
+    }
+}
+
+/// Alguém (GSP) vai escrever em `[lo, hi)`.
+pub fn before_write(lo: u32, hi: u32) {
+    if backend() == Backend::Vulkan {
+        crate::pica::timed(3, || vulkan::before_write(lo, hi));
+    }
+}
+
+/// Um MemoryFill terminou em `[lo, hi)` com padrão de `fill_bpp` bytes.
+pub fn after_fill(lo: u32, hi: u32, fill_bpp: u32) {
+    if backend() == Backend::Vulkan {
+        crate::pica::timed(3, || vulkan::after_fill(lo, hi, fill_bpp));
+    }
+}
+
+/// Fim de uma lista de comandos que desenhou: o backend de GPU executa o lote (a devolução para a memória guest é
+/// preguiçosa: acontece em `before_read`/`before_write`).
 pub fn end_list() {
     if backend() == Backend::Vulkan {
-        vulkan::flush();
+        vulkan::end_list();
     }
 }
 
@@ -234,4 +267,19 @@ pub fn hash_bytes(p: &[u8]) -> u64 {
         r = (r ^ hv).wrapping_mul(K).rotate_left(31);
     }
     r ^ (r >> 33)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// O código gravado no atômico tem de voltar como o mesmo backend (e 0 = "ainda não escolhido").
+    #[test]
+    fn backend_code_roundtrip() {
+        for b in [Backend::Soft, Backend::Vulkan, Backend::None] {
+            assert_ne!(code(b), 0);
+            assert_eq!(decode(code(b)), Some(b));
+        }
+        assert_eq!(decode(0), None);
+    }
 }

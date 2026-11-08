@@ -1,13 +1,13 @@
 //! Saída de som do DSP (cpal): os quadros de 160 amostras a 32728 Hz entram numa fila curta e o callback do
 //! dispositivo reamostra (linear) para a taxa dele. A taxa de leitura é ajustada em ±0,5% conforme o nível da
 //! fila, para absorver a diferença entre o relógio do DSP (thread do host) e o do dispositivo.
-//! Sem dispositivo, segue mudo. `YW_VOLUME` = volume mestre (0–100, padrão 100); `YW_AUDIO=none` não abre o
-//! dispositivo.
+//! Sem dispositivo, segue mudo. `YW_VOLUME` = volume mestre inicial (0–100, padrão 100); `YW_AUDIO=none` não abre o
+//! dispositivo. Volume e mudo mudam em tempo de execução (`set_volume` / `set_muted`, usados pelo menu da janela).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub const DSP_RATE: f64 = 32728.498;
@@ -17,7 +17,6 @@ const MAX: usize = 3 * TARGET;
 
 struct Shared {
     queue: Mutex<VecDeque<[i16; 2]>>,
-    gain: f32,
     underruns: AtomicU64,
     dropped: AtomicU64,
 }
@@ -25,11 +24,48 @@ struct Shared {
 /// `None` = sem saída (desligada ou sem dispositivo).
 static OUT: OnceLock<Option<Arc<Shared>>> = OnceLock::new();
 
-fn volume() -> f32 {
+/// Volume mestre em % (0–100); `u32::MAX` = ainda não definido → lê `YW_VOLUME` na primeira consulta.
+static VOLUME: AtomicU32 = AtomicU32::new(u32::MAX);
+static MUTED: AtomicBool = AtomicBool::new(false);
+
+fn env_volume() -> u32 {
     std::env::var("YW_VOLUME")
         .ok()
         .and_then(|v| v.trim().parse::<f32>().ok())
-        .map_or(1.0, |v| (v / 100.0).clamp(0.0, 1.0))
+        .map_or(100, |v| v.clamp(0.0, 100.0).round() as u32)
+}
+
+/// Volume mestre atual (0–100).
+pub fn volume() -> u32 {
+    let v = VOLUME.load(Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let e = env_volume();
+    let _ = VOLUME.compare_exchange(u32::MAX, e, Ordering::Relaxed, Ordering::Relaxed);
+    VOLUME.load(Ordering::Relaxed)
+}
+
+/// Muda o volume mestre (0–100) na hora.
+pub fn set_volume(pct: u32) {
+    VOLUME.store(pct.min(100), Ordering::Relaxed);
+}
+
+pub fn set_muted(m: bool) {
+    MUTED.store(m, Ordering::Relaxed);
+}
+
+pub fn muted() -> bool {
+    MUTED.load(Ordering::Relaxed)
+}
+
+/// Ganho linear aplicado às amostras agora.
+fn gain() -> f32 {
+    if muted() {
+        0.0
+    } else {
+        volume() as f32 / 100.0
+    }
 }
 
 fn start() -> Option<Arc<Shared>> {
@@ -39,7 +75,6 @@ fn start() -> Option<Arc<Shared>> {
     }
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::with_capacity(MAX + 160)),
-        gain: volume(),
         underruns: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
     });
@@ -63,7 +98,7 @@ fn start() -> Option<Arc<Shared>> {
         .ok()?;
     match rx.recv() {
         Ok(Ok(desc)) => {
-            eprintln!("[dsp] saída de som: {desc}, volume {:.0}%", shared.gain * 100.0);
+            eprintln!("[dsp] saída de som: {desc}, volume {}%{}", volume(), if muted() { " (mudo)" } else { "" });
             Some(shared)
         }
         Ok(Err(e)) => {
@@ -119,7 +154,7 @@ fn build<T: SizedSample + FromSample<f32>>(
                 }
                 let fill = q.len() as f64;
                 let step = base * (1.0 + 0.005 * ((fill - TARGET as f64) / TARGET as f64).clamp(-1.0, 1.0));
-                let g = shared.gain / 32768.0;
+                let g = gain() / 32768.0;
                 for out in data.chunks_mut(out_ch) {
                     let v = if waiting {
                         [0.0, 0.0]
@@ -128,7 +163,13 @@ fn build<T: SizedSample + FromSample<f32>>(
                         [cur[0] + (next[0] - cur[0]) * t, cur[1] + (next[1] - cur[1]) * t]
                     };
                     for (c, o) in out.iter_mut().enumerate() {
-                        let s = if out_ch == 1 { (v[0] + v[1]) * 0.5 } else { v[c.min(1)] };
+                        // estéreo vai só em FL/FR; centro, LFE e surround (ordem WAVE 5.1/7.1) ficam em silêncio
+                        let s = match (out_ch, c) {
+                            (1, _) => (v[0] + v[1]) * 0.5,
+                            (_, 0) => v[0],
+                            (_, 1) => v[1],
+                            _ => 0.0,
+                        };
                         *o = T::from_sample((s * g).clamp(-1.0, 1.0));
                     }
                     if waiting {

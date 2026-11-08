@@ -23,6 +23,7 @@ fn main() {
     let src = manifest.join("src/render/shaders");
     let pre = manifest.join("src/render/spv");
     println!("cargo:rerun-if-env-changed=YW_GLSLANG");
+    println!("cargo:rerun-if-env-changed=YW_UPDATE_SPV");
     let tool = glslang();
     for name in SHADERS {
         let input = src.join(name);
@@ -39,13 +40,34 @@ fn main() {
                         String::from_utf8_lossy(&o.stderr)
                     );
                 }
-                // mantém a cópia pré-gerada em dia (para quem compila sem o glslang)
-                let _ = std::fs::create_dir_all(&pre);
-                let _ = std::fs::copy(&dst, pre.join(&spv));
+                // Cópia pré-gerada (para quem compila sem o glslang): fica versionada em src/, então só é regravada
+                // quando o shader mudou depois dela (ou com YW_UPDATE_SPV=1) e o conteúdo é diferente. Uma versão
+                // diferente do glslang sozinha não suja a árvore do git.
+                update_prebuilt(&dst, &pre.join(&spv), &input);
             }
             None => copy_prebuilt(&pre.join(&spv), &dst),
         }
     }
+}
+
+fn update_prebuilt(fresh: &Path, prebuilt: &Path, source: &Path) {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let forced = std::env::var_os("YW_UPDATE_SPV").is_some_and(|v| v == "1");
+    let stale = match (mtime(source), mtime(prebuilt)) {
+        (Some(s), Some(p)) => s > p,
+        _ => true, // cópia ausente
+    };
+    if !(forced || stale) {
+        return;
+    }
+    let Ok(new) = std::fs::read(fresh) else { return };
+    if std::fs::read(prebuilt).is_ok_and(|old| old == new) {
+        return;
+    }
+    if let Some(dir) = prebuilt.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(prebuilt, new);
 }
 
 fn copy_prebuilt(from: &Path, to: &Path) {

@@ -2,8 +2,17 @@
 
 use super::{new_event, signal, unknown, Ipc};
 use crate::hle::kernel::Reset;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use yw1_rt::{w32, w8};
+
+/// Idioma do console no bloco 0x000A0002 (1 = inglês, 2 = francês, 5 = espanhol). A janela define a partir das
+/// configurações antes do `boot()`; sem janela fica em inglês.
+static LANGUAGE: AtomicU8 = AtomicU8::new(1);
+
+pub fn set_language(code: u8) {
+    LANGUAGE.store(code, Ordering::Relaxed);
+}
 
 pub fn cfg(ipc: &Ipc) {
     match ipc.cmd() {
@@ -49,8 +58,8 @@ fn config_block(id: u32, size: u32) -> Vec<u8> {
         d[..n].copy_from_slice(&bytes[..n]);
     };
     match id {
-        // idioma: 1 = inglês
-        0x000a_0002 => put(&[1]),
+        // idioma: 1 = inglês (padrão; ver `set_language`)
+        0x000a_0002 => put(&[LANGUAGE.load(Ordering::Relaxed)]),
         // país: [?, ?, província, país 49 = EUA]
         0x000b_0000 => put(&[0, 0, 2, 49]),
         // nome do usuário (UTF-16)

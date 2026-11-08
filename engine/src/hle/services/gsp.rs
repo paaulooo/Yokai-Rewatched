@@ -44,6 +44,9 @@ pub fn mapped(addr: u32) {
 
 /// Põe a interrupção na fila da thread 0 e sinaliza o evento.
 pub fn interrupt(id: u8) {
+    // VBlank e GPU são threads do host diferentes: uma de cada vez mexe na fila de interrupções
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap();
     let (addr, ev) = {
         let g = GSP.lock().unwrap();
         (g.addr, g.event)
@@ -72,6 +75,9 @@ pub fn interrupt(id: u8) {
     }
 }
 
+/// Trocas de framebuffer apresentadas por tela (quadros que o jogo mostrou).
+pub static SWAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Copia a informação de framebuffer "suja" para o estado de apresentação.
 fn update_framebuffer(addr: u32, screen: u32) {
     let b = addr + 0x200 + 0x40 * screen;
@@ -89,6 +95,7 @@ fn update_framebuffer(addr: u32, screen: u32) {
         format: r32(fb + 16),
     };
     gpu::set_framebuffer(screen, info);
+    SWAPS[screen as usize & 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     w8(b + 1, 0);
 }
 
@@ -181,7 +188,92 @@ pub fn request(ipc: &Ipc) {
     }
 }
 
-/// Executa a fila de comandos da thread 0.
+/// Um comando da fila do GX, já copiado da memória compartilhada (a fila é liberada na hora, como o módulo GSP do
+/// console faz ao despachar).
+#[derive(Clone, Debug)]
+enum GxCmd {
+    Dma(u32, u32, u32),
+    /// endereço, tamanho e as palavras copiadas no despacho
+    List(u32, u32, Vec<u32>),
+    Fill([u32; 7]),
+    Transfer([u32; 5]),
+    Copy([u32; 6]),
+}
+
+/// Executa um comando e devolve as interrupções que ele gera (na ordem).
+fn run_gx(c: GxCmd) -> &'static [u8] {
+    match c {
+        GxCmd::Dma(src, dst, size) => {
+            let mut buf = vec![0u8; size as usize];
+            yw1_rt::read_bytes(src, &mut buf);
+            if mem::is_mapped(dst) {
+                yw1_rt::write_bytes(dst, &buf);
+            }
+            &[DMA]
+        }
+        GxCmd::List(a, n, words) => {
+            gpu::submit_cmdlist_words(a, n, &words);
+            &[P3D]
+        }
+        GxCmd::Fill(p) => {
+            let control = p[6];
+            gpu::memory_fill(p[0], p[1], p[2], control & 0xffff);
+            if p[3] != 0 {
+                gpu::memory_fill(p[3], p[4], p[5], control >> 16);
+                &[PSC0, PSC1]
+            } else {
+                &[PSC0]
+            }
+        }
+        GxCmd::Transfer(p) => {
+            gpu::display_transfer(p[0], p[1], p[2], p[3], p[4]);
+            &[PPF]
+        }
+        GxCmd::Copy(p) => {
+            gpu::texture_copy(p[0], p[1], p[2], p[3], p[4], p[5]);
+            &[PPF]
+        }
+    }
+}
+
+/// `YW_GPU_SYNC=1`: executa os comandos do GX na própria thread do jogo, na hora (comportamento antigo).
+fn gpu_sync() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("YW_GPU_SYNC").is_ok_and(|v| v != "0"))
+}
+
+/// A "GPU" do console: uma thread do host que executa os comandos do GX em ordem e dispara a interrupção de cada um
+/// ao terminar — como o hardware, o jogo segue rodando enquanto a GPU trabalha e espera pelas interrupções
+/// (P3D/PPF/PSC). Antes tudo rodava dentro da thread do jogo: quadro do jogo = lógica + renderização > 16,7 ms → a
+/// espera de VBlank virava 3 períodos (20 quadros/s) em vez de 2 (30).
+static GX: Mutex<Option<std::sync::mpsc::Sender<GxCmd>>> = Mutex::new(None);
+
+fn dispatch(c: GxCmd) {
+    if gpu_sync() {
+        for &i in run_gx(c) {
+            interrupt(i);
+        }
+        return;
+    }
+    let mut g = GX.lock().unwrap();
+    let tx = g.get_or_insert_with(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<GxCmd>();
+        std::thread::Builder::new()
+            .name("gpu".into())
+            .spawn(move || {
+                for c in rx {
+                    for &i in run_gx(c) {
+                        interrupt(i);
+                    }
+                }
+            })
+            .expect("thread da GPU");
+        tx
+    });
+    let _ = tx.send(c);
+}
+
+/// Despacha a fila de comandos da thread 0 para a GPU.
 fn process_queue() {
     let addr = GSP.lock().unwrap().addr;
     if addr == 0 {
@@ -197,43 +289,12 @@ fn process_queue() {
         let cmd = q + 0x20 + 0x20 * index;
         let id = r8(cmd) as u8;
         let p = |i: u32| r32(cmd + 4 + 4 * i);
-        let int = match id {
-            0x00 => {
-                // RequestDma(src, dst, tamanho)
-                let (src, dst, size) = (p(0), p(1), p(2));
-                let mut buf = vec![0u8; size as usize];
-                yw1_rt::read_bytes(src, &mut buf);
-                if mem::is_mapped(dst) {
-                    yw1_rt::write_bytes(dst, &buf);
-                }
-                Some(DMA)
-            }
-            0x01 => {
-                gpu::submit_cmdlist(p(0), p(1));
-                Some(P3D)
-            }
-            0x02 => {
-                let control = p(6);
-                gpu::memory_fill(p(0), p(1), p(2), control & 0xffff);
-                if p(3) != 0 {
-                    gpu::memory_fill(p(3), p(4), p(5), control >> 16);
-                }
-                // PSC0 (e PSC1 se houve o segundo preenchimento)
-                if p(3) != 0 {
-                    interrupt(PSC0);
-                    Some(PSC1)
-                } else {
-                    Some(PSC0)
-                }
-            }
-            0x03 => {
-                gpu::display_transfer(p(0), p(1), p(2), p(3), p(4));
-                Some(PPF)
-            }
-            0x04 => {
-                gpu::texture_copy(p(0), p(1), p(2), p(3), p(4), p(5));
-                Some(PPF)
-            }
+        let c = match id {
+            0x00 => Some(GxCmd::Dma(p(0), p(1), p(2))),
+            0x01 => Some(GxCmd::List(p(0), p(1), crate::pica::read_list(p(0), p(1)))),
+            0x02 => Some(GxCmd::Fill([p(0), p(1), p(2), p(3), p(4), p(5), p(6)])),
+            0x03 => Some(GxCmd::Transfer([p(0), p(1), p(2), p(3), p(4)])),
+            0x04 => Some(GxCmd::Copy([p(0), p(1), p(2), p(3), p(4), p(5)])),
             0x05 => None,
             _ => {
                 eprintln!("[gsp] comando de fila {id:#x} desconhecido");
@@ -242,8 +303,8 @@ fn process_queue() {
         };
         w8(q, (index as u32 + 1) % 15);
         w8(q + 1, count as u32 - 1);
-        if let Some(i) = int {
-            interrupt(i);
+        if let Some(c) = c {
+            dispatch(c);
         }
     }
 }

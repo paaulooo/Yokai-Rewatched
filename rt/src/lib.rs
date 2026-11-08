@@ -137,7 +137,26 @@ pub fn host_ptr(a: u32) -> *mut u8 {
 
 // ---------------------------------------------------------------- ligações
 
+/// Preempção pendente: o kernel liga quando uma interrupção externa (VBlank, DSP…) acorda uma thread guest de
+/// prioridade maior que a que está rodando. O código gerado checa em saltos para trás e na entrada de função.
+pub static PREEMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ponto de checagem de preempção (custo: uma leitura atômica relaxada).
+#[inline(always)]
+pub fn poll(c: &mut Cpu) {
+    if PREEMPT.load(Ordering::Relaxed) {
+        preempt_slow(c);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn preempt_slow(c: &mut Cpu) {
+    unsafe { yw1_preempt(c) }
+}
+
 extern "Rust" {
+    fn yw1_preempt(c: &mut Cpu);
     fn yw1_svc(c: &mut Cpu, imm: u32);
     fn yw1_dispatch(c: &mut Cpu, va: u32, ret: u32);
 }
@@ -580,6 +599,8 @@ mod tests {
 
     #[no_mangle]
     fn yw1_svc(_c: &mut Cpu, _imm: u32) {}
+    #[no_mangle]
+    fn yw1_preempt(_c: &mut Cpu) {}
     #[no_mangle]
     fn yw1_dispatch(_c: &mut Cpu, _va: u32, _ret: u32) {}
 

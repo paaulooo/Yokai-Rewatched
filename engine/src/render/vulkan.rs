@@ -24,8 +24,9 @@
 //! dentro de um lote o destino de formatos com menos bits (RGB565, RGBA4, RGB5A1) não é requantizado entre draws;
 //! `color_read`/`depth_read` desligados (o soft lê 0 do destino) não são reproduzidos.
 
+use super::convert;
 use super::{color_bpp, depth_bpp, hash_bytes, uniforms, DrawUniforms, GpuVtx};
-use crate::hle::gpu::{read_pixel, tiled_offset, write_pixel};
+use crate::hle::gpu::{pica_color_fmt_to_gsp, read_pixel, tiled_offset, write_pixel};
 use crate::hle::mem;
 use crate::pica::raster::Ctx;
 use crate::pica::texture::{self, Tex};
@@ -40,8 +41,8 @@ static FS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pica_frag.spv")
 const VBUF_SIZE: u64 = 32 << 20;
 const UBUF_SIZE: u64 = 8 << 20;
 const RING_SIZE: u64 = 96 << 20;
-/// margem do anel de upload por draw (3 texturas 1024² + 2 superfícies)
-const RING_MARGIN: u64 = 20 << 20;
+/// Limite de memória das texturas em cache (imagens RGBA8). Acima disso descarta as menos usadas recentemente.
+const TEX_BUDGET: u64 = 384 << 20;
 const MAX_SETS: u32 = 8192;
 const COLOR_FMT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FMT: vk::Format = vk::Format::D32_SFLOAT_S8_UINT;
@@ -79,6 +80,21 @@ pub fn draw(ctx: &Ctx, verts: &[GpuVtx]) {
     }
 }
 
+/// Fim de uma lista de comandos com draws. O lote NÃO é executado aqui: continua aberto até alguém precisar da
+/// memória (`before_read`/`before_write`, textura que lê uma superfície) ou os buffers encherem — normalmente uma vez
+/// por quadro, no DisplayTransfer. `YW_VK_EAGER=1` executa e devolve tudo aqui (comportamento antigo).
+pub fn end_list() {
+    let mut g = VK.lock().unwrap();
+    let Some(v) = g.as_mut() else { return };
+    v.list += 1;
+    if eager() {
+        // SAFETY: ver `init`
+        if let Err(e) = unsafe { v.flush() } {
+            v.warn(&format!("flush: {e}"));
+        }
+    }
+}
+
 /// Executa o lote e devolve os render targets para a memória guest.
 pub fn flush() {
     let mut g = VK.lock().unwrap();
@@ -86,6 +102,37 @@ pub fn flush() {
     // SAFETY: ver `init`
     if let Err(e) = unsafe { v.flush() } {
         v.warn(&format!("flush: {e}"));
+    }
+}
+
+/// Antes de alguém (DisplayTransfer, TextureCopy) LER a faixa `[lo, hi)` da memória guest: superfícies com conteúdo
+/// só na GPU que a tocam voltam para a memória agora.
+pub fn before_read(lo: u32, hi: u32) {
+    with(|v| unsafe { v.sync_range(lo, hi, false) });
+}
+
+/// Antes de alguém (MemoryFill, DisplayTransfer, TextureCopy) ESCREVER em `[lo, hi)`: superfícies pendentes cobertas
+/// por inteiro são descartadas (a escrita vence); as parcialmente cobertas voltam para a memória antes.
+pub fn before_write(lo: u32, hi: u32) {
+    with(|v| unsafe { v.sync_range(lo, hi, true) });
+}
+
+/// Depois de um MemoryFill em `[lo, hi)` com padrão de `fill_bpp` bytes: superfícies inteiramente cobertas cujo
+/// pixel tem esse tamanho ficam uniformes — no próximo uso viram um clear na GPU em vez de upload pela CPU.
+pub fn after_fill(lo: u32, hi: u32, fill_bpp: u32) {
+    with(|v| v.fill_hint(lo, hi, fill_bpp));
+}
+
+/// Tudo o que só está na GPU volta para a memória (diagnóstico / antes de algo ler a memória inteira).
+pub fn sync_all() {
+    with(|v| unsafe { v.sync_range(0, u32::MAX, false) });
+}
+
+fn with(f: impl FnOnce(&mut Vk) -> Result<(), String>) {
+    let mut g = VK.lock().unwrap();
+    let Some(v) = g.as_mut() else { return };
+    if let Err(e) = f(v) {
+        v.warn(&format!("sincronismo: {e}"));
     }
 }
 
@@ -145,8 +192,20 @@ struct Surface {
     /// memória guest no último sincronismo (vazio = forçar upload)
     snapshot: Vec<u8>,
     synced: bool,
+    /// desenhada no lote que está sendo gravado
     dirty: bool,
+    /// a imagem da GPU é mais nova que a memória guest: o conteúdo está no `readback` (copiado no fim do lote) e só
+    /// volta para a memória quando alguém precisa ler/escrever essa faixa (`sync_range`) — devolução preguiçosa
+    pending: bool,
+    /// a memória foi preenchida por inteiro (MemoryFill) com este valor já decodificado: no próximo uso, clear na GPU
+    clear: Option<Clear>,
     last_used: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Clear {
+    Color([f32; 4]),
+    Depth(f32, u32),
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -161,6 +220,7 @@ struct TexKey {
 struct TexEntry {
     img: Img,
     last_used: u64,
+    bytes: u64,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
@@ -208,8 +268,13 @@ struct Vk {
     surfaces: HashMap<SurfKey, Surface>,
     fbs: HashMap<(SurfKey, SurfKey), vk::Framebuffer>,
     textures: HashMap<TexKey, TexEntry>,
-    /// (endereço, largura, altura, formato) → (lote, hash) — hash calculado uma vez por lote
+    /// soma de `TexEntry::bytes` (memória de GPU das texturas em cache)
+    tex_bytes: u64,
+    /// (endereço, largura, altura, formato) → (lista, hash) — hash recalculado uma vez por lista de comandos (o lote
+    /// pode cobrir várias listas e a CPU pode mudar uma textura entre elas)
     tex_hash: HashMap<(u32, u32, u32, u32), (u64, u64)>,
+    /// listas de comandos terminadas (`end_list`)
+    list: u64,
     dummy: Img,
     dummy_ready: bool,
     recording: bool,
@@ -222,6 +287,12 @@ struct Vk {
 // SAFETY: o objeto só é usado com o mutex `VK`; os ponteiros mapeados apontam para memória do dispositivo que vive
 // junto com ele.
 unsafe impl Send for Vk {}
+
+/// `YW_VK_EAGER=1`: devolve todos os render targets no fim de cada lote (comportamento antigo, para diagnóstico).
+fn eager() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("YW_VK_EAGER").is_ok_and(|v| v != "0"))
+}
 
 fn align(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
@@ -447,7 +518,9 @@ impl Vk {
             surfaces: HashMap::new(),
             fbs: HashMap::new(),
             textures: HashMap::new(),
+            tex_bytes: 0,
             tex_hash: HashMap::new(),
+            list: 0,
             dummy: Img { image: vk::Image::null(), mem: vk::DeviceMemory::null(), view: vk::ImageView::null() },
             dummy_ready: false,
             recording: false,
@@ -609,6 +682,14 @@ impl Vk {
         self.full_barrier(self.cmd_main);
         if !self.dummy_ready {
             self.init_layout(self.dummy.image, vk::ImageAspectFlags::COLOR);
+            // conteúdo definido para o dummy (vai em descritores de unidades desligadas; nunca recebe upload)
+            self.device.cmd_clear_color_image(
+                self.cmd_pre,
+                self.dummy.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+                &[range(vk::ImageAspectFlags::COLOR)],
+            );
             self.dummy_ready = true;
         }
         self.recording = true;
@@ -657,12 +738,22 @@ impl Vk {
             .filter_map(|(i, t)| t.filter(|t| t.addr != 0 && t.w != 0 && t.h != 0).map(|t| (i, t)))
             .collect();
 
+        // Pior caso de uso do anel de upload por ESTE draw: as texturas dele (RGBA8, até 2047² cada — os campos de
+        // tamanho de 0x82/0x92/0x9A têm 11 bits) e as duas superfícies (cor 4 B/pixel; profundidade 4 B + 1 B de
+        // estêncil), mais o alinhamento de 16 de cada reserva. Uma margem fixa (antes: 20 MB) ficava abaixo disso.
+        let ring_need: u64 = texs.iter().map(|(_, t)| t.w as u64 * t.h as u64 * 4 + 16).sum::<u64>()
+            + w as u64 * h as u64 * (4 + 5)
+            + 32;
+        if ring_need > RING_SIZE {
+            self.warn(&format!("draw ignorado: precisa de {ring_need} bytes no anel de upload (> {RING_SIZE})"));
+            return Ok(());
+        }
         // descarrega antes se: falta espaço, ou o draw lê/usa memória que outra superfície do lote sujou
         if self.recording {
             let full = self.vused + vbytes > VBUF_SIZE
                 || self.uused + self.ustride > UBUF_SIZE
                 || self.sets_used + 1 > MAX_SETS
-                || self.rused + RING_MARGIN > RING_SIZE;
+                || align(self.rused, 16) + ring_need > RING_SIZE;
             let tex_hazard = texs.iter().any(|(_, t)| {
                 let n = t.w * t.h * texture::bits_per_texel(t.format) / 8;
                 self.overlaps_dirty(t.addr, t.addr + n, None)
@@ -675,11 +766,35 @@ impl Vk {
                 self.flush()?;
             }
         }
+        // texturas e alvos leem a memória: o que só está na GPU e toca essas faixas volta antes
+        for (_, t) in &texs {
+            let n = t.w * t.h * texture::bits_per_texel(t.format) / 8;
+            self.sync_range(t.addr, t.addr + n, false)?;
+        }
+        for k in [ck, dk] {
+            if k.addr == 0 {
+                continue;
+            }
+            let (a, b) = k.range();
+            let others: Vec<SurfKey> = self
+                .surfaces
+                .iter()
+                .filter(|(o, s)| **o != k && s.pending && o.addr != 0 && o.range().0 < b && a < o.range().1)
+                .map(|(o, _)| *o)
+                .collect();
+            for o in others {
+                self.materialize(o);
+            }
+        }
         self.begin()?;
 
         let mut views = [self.dummy.view; 3];
+        // unidades cuja memória não está mapeada: `texture` devolve o dummy 1×1, então o shader não pode usar o
+        // tamanho real (texelFetch fora da imagem é indefinido sem robustImageAccess)
+        let mut missing = [false; 3];
         for (i, t) in &texs {
             views[*i] = self.texture(t)?;
+            missing[*i] = views[*i] == self.dummy.view;
         }
         let cview = self.surface(ck)?;
         let dview = self.surface(dk)?;
@@ -723,7 +838,13 @@ impl Vk {
         std::ptr::copy_nonoverlapping(verts.as_ptr() as *const u8, self.vbuf.ptr.add(self.vused as usize), vbytes as usize);
         let voff = self.vused;
         self.vused = align(self.vused + vbytes, 16);
-        let u = uniforms(ctx);
+        let mut u = uniforms(ctx);
+        for (i, m) in missing.iter().enumerate() {
+            if *m {
+                // largura/altura 0 → o shader devolve (0, 0, 0, 255), como `texture::sample` sem textura
+                u.tex[i][0] = 0;
+            }
+        }
         std::ptr::copy_nonoverlapping(
             &u as *const DrawUniforms as *const u8,
             self.ubuf.ptr.add(self.uused as usize),
@@ -800,8 +921,9 @@ impl Vk {
     fn pipe_key(&mut self, c: &Ctx) -> PipeKey {
         let have_d = c.depth_addr != 0;
         let mut mask = if c.color_addr == 0 || !c.color_write { 0 } else { c.color_mask & 0xf };
-        // formatos sem alfa (RGB8, RGB565): o soft sempre lê A = 255 do destino — não deixa o A da imagem mudar
-        if matches!(c.color_fmt, 1 | 2) {
+        // formatos sem alfa (numeração do PICA: RGB8 = 1, RGB565 = 3; o 2 é RGB5A1, que TEM alfa): o soft sempre lê
+        // A = 255 do destino — não deixa o A da imagem mudar
+        if matches!(c.color_fmt, 1 | 3) {
             mask &= 7;
         }
         let dwrite = have_d && c.depth_write && c.depth_rw;
@@ -964,7 +1086,10 @@ impl Vk {
             )?;
             self.init_layout(img.image, aspect);
             let readback = self.host_buf(rb, vk::BufferUsageFlags::TRANSFER_DST, true)?;
-            self.surfaces.insert(k, Surface { img, readback, snapshot: Vec::new(), synced: false, dirty: false, last_used: 0 });
+            self.surfaces.insert(
+                k,
+                Surface { img, readback, snapshot: Vec::new(), synced: false, dirty: false, pending: false, clear: None, last_used: 0 },
+            );
         }
         let batch = self.batch;
         let s = self.surfaces.get_mut(&k).unwrap();
@@ -973,24 +1098,64 @@ impl Vk {
         if k.addr == 0 || s.synced {
             return Ok(view);
         }
-        s.synced = true;
-        let Some(mem) = guest_slice(k.addr, k.bytes()) else { return Ok(view) };
-        if !s.snapshot.is_empty() && s.snapshot.as_slice() == mem {
+        // conteúdo só na GPU (devolução pendente): a imagem é a versão mais nova
+        if s.pending {
+            s.synced = true;
             return Ok(view);
         }
-        s.snapshot = mem.to_vec();
+        let Some(mem) = guest_slice(k.addr, k.bytes()) else {
+            s.synced = true;
+            return Ok(view);
+        };
+        if let Some(c) = s.clear.take() {
+            s.synced = true;
+            s.snapshot = mem.to_vec();
+            let image = s.img.image;
+            match c {
+                Clear::Color(rgba) => self.device.cmd_clear_color_image(
+                    self.cmd_pre,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: rgba },
+                    &[range(vk::ImageAspectFlags::COLOR)],
+                ),
+                Clear::Depth(z, st) => self.device.cmd_clear_depth_stencil_image(
+                    self.cmd_pre,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearDepthStencilValue { depth: z, stencil: st },
+                    &[range(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)],
+                ),
+            }
+            self.stats[2] += 1;
+            return Ok(view);
+        }
+        if !s.snapshot.is_empty() && s.snapshot.as_slice() == mem {
+            s.synced = true;
+            return Ok(view);
+        }
         let image = s.img.image;
         let t0 = std::time::Instant::now();
         // carrega: memória (blocos 8×8, linhas de baixo para cima) → imagem linear
         let (w, h) = (k.w, k.h);
         let n = (w * h) as u64;
         let bytes = if k.depth { n * 5 } else { n * 4 };
+        // Reserva o anel ANTES de marcar a superfície como sincronizada: se faltar espaço, snapshot/synced ficam
+        // como estavam e o próximo uso tenta carregar de novo (antes ficava com conteúdo velho para sempre).
         let Some(off) = self.ring_alloc(bytes) else {
             return Err("anel de upload cheio (superfície)".into());
         };
+        let s = self.surfaces.get_mut(&k).unwrap();
+        s.synced = true;
+        s.snapshot = mem.to_vec();
         let dst = std::slice::from_raw_parts_mut(self.ring.ptr.add(off as usize), bytes as usize);
         let bpp = k.bpp();
-        for y in 0..h {
+        let fast = if k.depth {
+            convert::depth_to_linear(mem, w, h, bpp, k.fmt, dst)
+        } else {
+            convert::color_to_linear(mem, w, h, pica_color_fmt_to_gsp(k.fmt), dst)
+        };
+        for y in 0..if fast { 0 } else { h } {
             for x in 0..w {
                 let a = k.addr + tiled_offset(x, h - 1 - y, w, bpp);
                 let i = (y * w + x) as usize;
@@ -1007,7 +1172,7 @@ impl Vk {
                     dst[4 * i..4 * i + 4].copy_from_slice(&f.to_le_bytes());
                     dst[4 * n as usize + i] = st as u8;
                 } else {
-                    dst[4 * i..4 * i + 4].copy_from_slice(&read_pixel(a, k.fmt));
+                    dst[4 * i..4 * i + 4].copy_from_slice(&read_pixel(a, pica_color_fmt_to_gsp(k.fmt)));
                 }
             }
         }
@@ -1023,11 +1188,11 @@ impl Vk {
         let n = t.w * t.h * texture::bits_per_texel(t.format) / 8;
         let gk = (t.addr, t.w, t.h, t.format);
         let hash = match self.tex_hash.get(&gk) {
-            Some(&(b, hv)) if b == self.batch => hv,
+            Some(&(l, hv)) if l == self.list => hv,
             _ => {
                 let Some(mem) = guest_slice(t.addr, n) else { return Ok(self.dummy.view) };
                 let hv = hash_bytes(mem);
-                self.tex_hash.insert(gk, (self.batch, hv));
+                self.tex_hash.insert(gk, (self.list, hv));
                 hv
             }
         };
@@ -1069,7 +1234,8 @@ impl Vk {
         };
         self.device.cmd_copy_buffer_to_image(self.cmd_pre, self.ring.buf, img.image, vk::ImageLayout::GENERAL, &[region]);
         let view = img.view;
-        self.textures.insert(key, TexEntry { img, last_used: self.batch });
+        self.textures.insert(key, TexEntry { img, last_used: self.batch, bytes });
+        self.tex_bytes += bytes;
         self.stats[3] += 1;
         Ok(view)
     }
@@ -1115,12 +1281,62 @@ impl Vk {
         self.stats[5] += t0.elapsed().as_micros() as u64;
         let t1 = std::time::Instant::now();
 
-        // imagem → memória guest (mesmo formato que o soft escreveria)
+        // imagem → memória guest: preguiçoso. O conteúdo fica no `readback` e só é convertido quando alguém precisar
+        // da faixa (`sync_range`). `YW_VK_EAGER=1` volta ao comportamento antigo (devolve tudo no fim de cada lote).
         for k in &dirty {
             let s = self.surfaces.get_mut(k).unwrap();
             s.dirty = false;
+            s.pending = true;
+            s.clear = None;
+        }
+        if eager() {
+            for k in &dirty {
+                self.materialize(*k);
+            }
+        }
+        self.stats[6] += t1.elapsed().as_micros() as u64;
+        for s in self.surfaces.values_mut() {
+            s.synced = false;
+        }
+        vkr!(d.reset_descriptor_pool(self.desc_pool, vk::DescriptorPoolResetFlags::empty()), "vkResetDescriptorPool");
+        self.sets_used = 0;
+        self.vused = 0;
+        self.uused = 0;
+        self.rused = 0;
+        self.batch += 1;
+        self.stats[1] += 1;
+        self.evict();
+        Ok(())
+    }
+
+    /// Converte o `readback` de uma superfície pendente para a memória guest (mesmo formato que o soft escreveria).
+    unsafe fn materialize(&mut self, k: SurfKey) {
+        let Some(s) = self.surfaces.get_mut(&k) else { return };
+        if !s.pending {
+            return;
+        }
+        s.pending = false;
+        let t0 = std::time::Instant::now();
+        {
             if guest_slice(k.addr, k.bytes()).is_none() {
-                continue;
+                return;
+            }
+            let (w, h) = (k.w, k.h);
+            let n = (w * h) as usize;
+            let src = std::slice::from_raw_parts(s.readback.ptr, if k.depth { 5 * n } else { 4 * n });
+            let bpp = k.bpp();
+            // SAFETY: faixa mapeada (conferida acima); o jogo está parado nesta chamada (lista/GSP)
+            let memw = std::slice::from_raw_parts_mut(yw1_rt::host_ptr(k.addr), k.bytes() as usize);
+            let fast = if k.depth {
+                convert::depth_from_linear(src, w, h, bpp, k.fmt, memw)
+            } else {
+                convert::color_from_linear(src, w, h, pica_color_fmt_to_gsp(k.fmt), memw)
+            };
+            if fast {
+                let lossy = !k.depth && k.fmt >= 2;
+                s.snapshot = if lossy { Vec::new() } else { memw.to_vec() };
+                self.stats[6] += t0.elapsed().as_micros() as u64;
+                return;
             }
             let (w, h) = (k.w, k.h);
             let n = (w * h) as usize;
@@ -1146,7 +1362,7 @@ impl Vk {
                             }
                         }
                     } else {
-                        write_pixel(a, k.fmt, src[4 * i..4 * i + 4].try_into().unwrap());
+                        write_pixel(a, pica_color_fmt_to_gsp(k.fmt), src[4 * i..4 * i + 4].try_into().unwrap());
                     }
                 }
             }
@@ -1154,33 +1370,111 @@ impl Vk {
             let lossy = !k.depth && k.fmt >= 2;
             s.snapshot = if lossy { Vec::new() } else { guest_slice(k.addr, k.bytes()).unwrap().to_vec() };
         }
-        self.stats[6] += t1.elapsed().as_micros() as u64;
-        for s in self.surfaces.values_mut() {
+        self.stats[6] += t0.elapsed().as_micros() as u64;
+    }
+
+    /// Alguém vai ler (`write` = falso) ou escrever em `[lo, hi)` da memória guest. Se o lote gravado desenhou ali,
+    /// executa-o; depois devolve as superfícies pendentes que tocam a faixa (numa escrita, as cobertas por inteiro
+    /// são só descartadas — a escrita sobrescreve tudo mesmo).
+    unsafe fn sync_range(&mut self, lo: u32, hi: u32, write: bool) -> Result<(), String> {
+        if self.recording && self.overlaps_dirty(lo, hi, None) {
+            self.flush()?;
+        }
+        let hit: Vec<SurfKey> = self
+            .surfaces
+            .iter()
+            .filter(|(k, s)| {
+                let (a, b) = k.range();
+                s.pending && k.addr != 0 && a < hi && lo < b
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in hit {
+            let (a, b) = k.range();
+            if write && lo <= a && b <= hi {
+                let s = self.surfaces.get_mut(&k).unwrap();
+                s.pending = false;
+                s.snapshot = Vec::new();
+                s.synced = false;
+            } else {
+                self.materialize(k);
+            }
+        }
+        Ok(())
+    }
+
+    /// MemoryFill terminou em `[lo, hi)`: superfícies cobertas por inteiro, sem conteúdo pendente, com pixel do mesmo
+    /// tamanho do padrão → guarda o valor (decodificado da própria memória) para limpar na GPU no próximo uso.
+    fn fill_hint(&mut self, lo: u32, hi: u32, fill_bpp: u32) -> Result<(), String> {
+        for (k, s) in self.surfaces.iter_mut() {
+            let (a, b) = k.range();
+            if k.addr == 0 || s.pending || s.dirty || !(lo <= a && b <= hi) || k.bpp() != fill_bpp {
+                continue;
+            }
+            let Some(m) = guest_slice(k.addr, k.bpp()) else { continue };
+            s.clear = Some(if k.depth {
+                let (zi, st) = match k.bpp() {
+                    2 => (u16::from_le_bytes([m[0], m[1]]) as u32, 0),
+                    3 => (m[0] as u32 | (m[1] as u32) << 8 | (m[2] as u32) << 16, 0),
+                    _ => {
+                        let v = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+                        (v & 0xff_ffff, if k.fmt == 3 { v >> 24 } else { 0 })
+                    }
+                };
+                Clear::Depth(zi as f32 * (1.0 / 16_777_216.0), st)
+            } else {
+                let p = convert::decode(pica_color_fmt_to_gsp(k.fmt), m);
+                Clear::Color(p.map(|c| c as f32 / 255.0))
+            });
             s.synced = false;
         }
-        vkr!(d.reset_descriptor_pool(self.desc_pool, vk::DescriptorPoolResetFlags::empty()), "vkResetDescriptorPool");
-        self.sets_used = 0;
-        self.vused = 0;
-        self.uused = 0;
-        self.rused = 0;
-        self.batch += 1;
-        self.stats[1] += 1;
-        self.evict();
         Ok(())
     }
 
     /// Libera texturas e superfícies sem uso há muito tempo (só entre lotes, com o GPU parado).
     unsafe fn evict(&mut self) {
         let b = self.batch;
+        // (1) versões velhas: quando a CPU muda o conteúdo de uma textura (vídeo, texto, atlas), o hash novo cria outra
+        // entrada para o mesmo (endereço, tamanho, formato). Num lote só uma versão é usada (o hash é calculado uma
+        // vez por lote), então toda versão usada antes da mais recente já não serve e sai agora (o GPU está parado).
+        let mut newest: HashMap<(u32, u32, u32, u32), u64> = HashMap::new();
+        for (k, e) in &self.textures {
+            let n = newest.entry((k.addr, k.w, k.h, k.fmt)).or_insert(0);
+            *n = (*n).max(e.last_used);
+        }
+        let mut old: Vec<TexKey> = self
+            .textures
+            .iter()
+            .filter(|(k, e)| e.last_used < newest[&(k.addr, k.w, k.h, k.fmt)])
+            .map(|(k, _)| *k)
+            .collect();
+        // (2) muitas entradas: as sem uso há 300 lotes
         if self.textures.len() > 1500 {
-            let old: Vec<TexKey> = self.textures.iter().filter(|(_, e)| e.last_used + 300 < b).map(|(k, _)| *k).collect();
-            for k in old {
+            old.extend(self.textures.iter().filter(|(_, e)| e.last_used + 300 < b).map(|(k, _)| *k));
+        }
+        old.sort_unstable_by_key(|k| (k.addr, k.w, k.h, k.fmt, k.hash));
+        old.dedup();
+        for k in old {
+            let e = self.textures.remove(&k).unwrap();
+            self.tex_bytes -= e.bytes;
+            self.free_img(&e.img);
+        }
+        // (3) limite de memória: descarta as menos usadas recentemente até caber
+        if self.tex_bytes > TEX_BUDGET {
+            let mut lru: Vec<(u64, TexKey)> = self.textures.iter().map(|(k, e)| (e.last_used, *k)).collect();
+            lru.sort_unstable_by_key(|(u, _)| *u);
+            for (_, k) in lru {
+                if self.tex_bytes <= TEX_BUDGET {
+                    break;
+                }
                 let e = self.textures.remove(&k).unwrap();
+                self.tex_bytes -= e.bytes;
                 self.free_img(&e.img);
             }
         }
         if self.tex_hash.len() > 4096 {
-            self.tex_hash.retain(|_, (bb, _)| *bb + 2 >= b);
+            let l = self.list;
+            self.tex_hash.retain(|_, (ll, _)| *ll + 2 >= l);
         }
         if self.surfaces.len() > 32 {
             let old: Vec<SurfKey> = self.surfaces.iter().filter(|(_, s)| s.last_used + 3000 < b).map(|(k, _)| *k).collect();

@@ -85,6 +85,8 @@ pub struct State {
     next_handle: u32,
     threads: Vec<Thread>,
     running: Option<usize>,
+    /// desde quando nenhuma thread guest roda (console ocioso, esperando VBlank/evento)
+    idle_since: Option<Instant>,
     seq: u64,
     start: Option<Instant>,
 }
@@ -101,6 +103,7 @@ pub static K: Kernel = Kernel {
         next_handle: 0x10,
         threads: Vec::new(),
         running: None,
+        idle_since: None,
         seq: 0,
         start: None,
     }),
@@ -294,19 +297,20 @@ impl Kernel {
             }
         }
         g.running = None;
+        g.idle_since = Some(Instant::now());
         self.schedule(&mut g);
         loop {
             if g.running == Some(me) {
                 break;
             }
             // ninguém rodando: quem esperar o próximo prazo cuida dele
-            let timeout = g.next_deadline().map(|d| d.saturating_duration_since(Instant::now()));
+            let timeout = g.next_deadline().map(|d| d.saturating_duration_since(console_now()));
             g = match timeout {
                 Some(t) if g.running.is_none() => self.cv.wait_timeout(g, t.max(Duration::from_micros(50))).unwrap().0,
                 _ => self.cv.wait(g).unwrap(),
             };
             if g.running.is_none() {
-                g.expire(Instant::now());
+                g.expire(console_now());
                 self.schedule(&mut g);
             }
         }
@@ -322,6 +326,9 @@ impl Kernel {
         if let Some(t) = g.pick() {
             g.threads[t].state = TState::Running;
             g.running = Some(t);
+            if let Some(t0) = g.idle_since.take() {
+                IDLE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             self.cv.notify_all();
         }
     }
@@ -345,6 +352,28 @@ impl Kernel {
         }
         g.wake_waiters();
         self.schedule(&mut g);
+        // acordou alguém mais prioritário que a thread que está rodando: o código gerado cede a vez no próximo ponto
+        // de checagem (salto para trás / entrada de função), como a preempção do núcleo de aplicativo do 3DS
+        if let Some(r) = g.running {
+            let rp = g.threads[r].prio;
+            if g.threads.iter().any(|t| t.state == TState::Ready && t.prio < rp) {
+                yw1_rt::PREEMPT.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Ponto de preempção do código guest (`rt::poll`): se há uma thread pronta mais prioritária, cede a vez.
+    pub fn preempt_point(&self) {
+        yw1_rt::PREEMPT.store(false, std::sync::atomic::Ordering::Relaxed);
+        let me = current();
+        if me == usize::MAX {
+            return;
+        }
+        let g = self.lock();
+        if g.running != Some(me) {
+            return;
+        }
+        drop(self.maybe_preempt(g));
     }
 
     /// Registra a thread guest atual (chamado pela própria thread do SO antes de rodar código guest).
@@ -412,6 +441,19 @@ pub fn spawn_thread(entry: u32, arg: u32, stack_top: u32, prio: i32) -> (usize, 
 }
 
 /// Estado de todas as threads guest (diagnóstico de travamentos).
+/// Diagnóstico de travamento: thread em execução, função guest atual e registradores (leitura sem parar a thread).
+pub fn running_snapshot() -> String {
+    let g = K.lock();
+    let Some(tid) = g.running else { return "nenhuma thread rodando".into() };
+    let t = &g.threads[tid];
+    if t.cpu == 0 {
+        return format!("t{tid} sem Cpu");
+    }
+    // SAFETY: Cpu da thread viva; leitura concorrente só para diagnóstico
+    let c = unsafe { &*(t.cpu as *const Cpu) };
+    format!("t{tid} prio {} função {:#x} r={:08x?}", t.prio, c.func, &c.r)
+}
+
 pub fn threads_report() -> String {
     let g = K.lock();
     let mut s = String::new();
@@ -484,11 +526,22 @@ fn exit_thread() {
     K.schedule(&mut g);
 }
 
+/// Tempo total (ns) em que nenhuma thread guest rodava — o resto é código do jogo + HLE + renderização.
+pub static IDLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// "Agora" do console: o relógio do host menos o tempo em que o menu pausou o jogo. Prazos (sleep, timeouts) e a
+/// expiração usam este relógio, então param junto com a pausa e não disparam todos de uma vez ao voltar.
+pub fn console_now() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_nanos(crate::hle::paused_ns())).unwrap_or(now)
+}
+
 pub fn ns_to_deadline(ns: i64) -> Option<Instant> {
     if ns < 0 {
         None
     } else {
-        Some(Instant::now() + Duration::from_nanos(ns as u64))
+        // relógio do console acelerado nos testes (`YW_SPEED`): o tempo guest passa `speed` vezes mais rápido
+        Some(console_now() + Duration::from_nanos((ns as f64 / crate::hle::speed()) as u64))
     }
 }
 
@@ -496,12 +549,24 @@ pub fn ns_to_deadline(ns: i64) -> Option<Instant> {
 pub fn system_tick() -> u64 {
     let mut g = K.lock();
     let t0 = *g.start.get_or_insert_with(Instant::now);
-    (t0.elapsed().as_secs_f64() * 268_111_856.0) as u64
+    let run = t0.elapsed().saturating_sub(Duration::from_nanos(crate::hle::paused_ns()));
+    (run.as_secs_f64() * crate::hle::speed() * 268_111_856.0) as u64
 }
 
 
 /// Tratamento das syscalls (chamado por `yw1_svc`).
+pub static DIAG_SVC: [std::sync::atomic::AtomicU32; 64] = [const { std::sync::atomic::AtomicU32::new(0) }; 64];
+pub fn diag_running() -> (Option<usize>, u32, bool) {
+    let g = K.lock();
+    let r = g.running;
+    let t8w = g.threads.get(8).is_some_and(|t| t.state == TState::Waiting && matches!(t.wait, Some(WaitOn::Objects{..})));
+    (r, r.map_or(0, |t| DIAG_SVC[t].load(std::sync::atomic::Ordering::Relaxed)), t8w)
+}
+struct DiagGuard(usize);
+impl Drop for DiagGuard { fn drop(&mut self) { DIAG_SVC[self.0].store(0, std::sync::atomic::Ordering::Relaxed); } }
 pub fn svc(c: &mut Cpu, n: u32) {
+    DIAG_SVC[current()].store(n + 0x100 * (if n == 0x32 { 1 } else { 0 }) + 1, std::sync::atomic::Ordering::Relaxed);
+    let _dg = DiagGuard(current());
     if trace() {
         eprintln!(
             "[svc] t{} {n:#04x} r0={:08x} r1={:08x} r2={:08x} r3={:08x} lr={:08x}",

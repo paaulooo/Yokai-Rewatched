@@ -39,6 +39,12 @@ pub static GPU: Mutex<State> = Mutex::new(State {
     pending: Vec::new(),
 });
 
+/// `YW_GPU_TRACE=1`: registra cada combinação nova de parâmetros de DisplayTransfer/framebuffer.
+fn trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("YW_GPU_TRACE").is_ok_and(|v| v != "0"))
+}
+
 pub fn set_framebuffer(screen: u32, info: FbInfo) {
     if let Some(f) = GPU.lock().unwrap().fb.get_mut(screen as usize) {
         *f = info;
@@ -65,6 +71,11 @@ pub fn hw_regs_written(reg: u32, size: u32, ptr: u32) {
 }
 
 pub fn submit_cmdlist(addr: u32, size: u32) {
+    submit_cmdlist_words(addr, size, &crate::pica::read_list(addr, size));
+}
+
+/// Lista já copiada da memória no despacho (GPU assíncrona).
+pub fn submit_cmdlist_words(addr: u32, size: u32, words: &[u32]) {
     let mut g = GPU.lock().unwrap();
     g.cmdlists += 1;
     g.pending.push((addr, size));
@@ -72,11 +83,19 @@ pub fn submit_cmdlist(addr: u32, size: u32) {
         g.pending.remove(0);
     }
     drop(g);
-    crate::pica::execute(addr, size);
+    crate::pica::execute_words(words);
 }
 
 /// Preenche `[start, end)` com `value`; `control` bits 8/9 = 24/32 bits (senão 16).
 pub fn memory_fill(start: u32, value: u32, end: u32, control: u32) {
+    // o backend de GPU devolve/descarta antes o que só ele tem nessa faixa e, depois, transforma o fill em clear
+    crate::render::before_write(start, end);
+    crate::pica::timed(5, || memory_fill_inner(start, value, end, control));
+    let fill_bpp = if control & 0x200 != 0 { 4 } else if control & 0x100 != 0 { 3 } else { 2 };
+    crate::render::after_fill(start, end, fill_bpp);
+}
+
+fn memory_fill_inner(start: u32, value: u32, end: u32, control: u32) {
     if start == 0 || end <= start || !super::mem::is_mapped(start) {
         return;
     }
@@ -171,15 +190,50 @@ pub fn write_pixel(a: u32, format: u32, p: [u8; 4]) {
     }
 }
 
+/// Formato de cor de render target do PICA → numeração do GSP/LCD que `read_pixel`/`write_pixel` usam.
+/// As duas tabelas diferem nos formatos de 16 bits: PICA (registrador 0x117, bits 16–18) é RGBA8 0, RGB8 1,
+/// RGB5A1 2, RGB565 3, RGBA4 4; GSP (DisplayTransfer e framebuffers do LCD) é RGBA8 0, RGB8 1, RGB565 2, RGB5A1 3,
+/// RGBA4 4 (Azahar: `regs_framebuffer.h` ColorFormat × `regs_external.h` PixelFormat). Quem lê/escreve um render
+/// target com o formato do PICA tem de passar por aqui.
+pub fn pica_color_fmt_to_gsp(fmt: u32) -> u32 {
+    match fmt & 7 {
+        2 => 3,
+        3 => 2,
+        f => f,
+    }
+}
+
 /// DisplayTransfer(entrada, saída, dimensões de entrada, de saída, flags).
 /// flags: bit0 inverter vertical, bit1 entrada linear (→ saída em blocos), bit3 cópia crua, bit5 sem swizzle,
 /// bits 8–10 formato de entrada, 12–14 formato de saída, 24–25 redução (0 nenhuma, 1 2×1, 2 2×2).
 pub fn display_transfer(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
+    let (iw, ih, ow, oh) = (in_dims & 0xffff, in_dims >> 16, out_dims & 0xffff, out_dims >> 16);
+    crate::render::before_read(inp, inp.wrapping_add(iw * ih * bpp((flags >> 8) & 7)));
+    crate::render::before_write(out, out.wrapping_add(ow * oh * bpp((flags >> 12) & 7)));
+    crate::pica::timed(4, || display_transfer_inner(inp, out, in_dims, out_dims, flags))
+}
+
+fn display_transfer_inner(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
     if !super::mem::is_mapped(inp) || !super::mem::is_mapped(out) {
         eprintln!("[gpu] DisplayTransfer com endereço não mapeado {inp:#x} → {out:#x}");
         return;
     }
     GPU.lock().unwrap().transfers += 1;
+    if trace() {
+        static SEEN: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+        let k = (in_dims, out_dims, flags);
+        let mut s = SEEN.lock().unwrap();
+        if !s.contains(&k) {
+            s.push(k);
+            eprintln!(
+                "[gpu] DisplayTransfer novo: {inp:#x} {}x{} → {out:#x} {}x{} flags {flags:#x}",
+                in_dims & 0xffff,
+                in_dims >> 16,
+                out_dims & 0xffff,
+                out_dims >> 16
+            );
+        }
+    }
     let (iw, ih) = (in_dims & 0xffff, in_dims >> 16);
     let (ow, oh) = (out_dims & 0xffff, out_dims >> 16);
     let flip = flags & 1 != 0;
@@ -194,6 +248,9 @@ pub fn display_transfer(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: 
         _ => (1, 1),
     };
     let (bi, bo) = (bpp(fin), bpp(fout));
+    // Citra `GPU::DisplayTransfer`: com redução, a largura/altura de saída do registrador é dividida pela escala e
+    // ESSA é a largura de linha da saída (antes usávamos a do registrador: listras nas cenas 3D com 2×1, 480→240)
+    let (ow, oh) = (ow / sx, oh / sy);
     let w = ow.min(iw / sx);
     let h = oh.min(ih / sy);
     for y in 0..h {
@@ -234,6 +291,13 @@ pub fn texture_copy(inp: u32, out: u32, total: u32, in_wg: u32, out_wg: u32, _fl
     let (iw, ig) = ((in_wg & 0xffff) * 16, (in_wg >> 16) * 16);
     let (ow, og) = ((out_wg & 0xffff) * 16, (out_wg >> 16) * 16);
     let (iw, ow) = (if iw == 0 { total } else { iw }, if ow == 0 { total } else { ow });
+    if iw == 0 || ow == 0 {
+        return;
+    }
+    // faixas tocadas (linhas de `iw`/`ow` bytes separadas por `ig`/`og`)
+    let span = |w: u32, g: u32| total.div_ceil(w) * (w + g);
+    crate::render::before_read(inp, inp.wrapping_add(span(iw, ig)));
+    crate::render::before_write(out, out.wrapping_add(span(ow, og)));
     let mut done = 0;
     let (mut ia, mut oa) = (inp, out);
     let (mut il, mut ol) = (0, 0);

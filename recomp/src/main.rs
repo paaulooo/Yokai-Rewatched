@@ -567,6 +567,34 @@ fn main() {
         }
     }
     let mut ptrs: BTreeSet<u32> = BTreeSet::new();
+    // saltos diretos (`b alvo`) que saem de uma região densa: o assembly à mão pula para o meio de outras funções
+    // (ex.: 0x269ee8 → 0x266bcc). Na descoberta normal esses blocos eram da função original; decodificada em linha,
+    // a região perde-os — o alvo vira entrada extra da função que contém a instrução.
+    let mut dense_out: Vec<(u32, u32)> = Vec::new();
+    for &(a, b) in &regions {
+        for (&pc, i) in &funcs[&a].insts {
+            if let Flow::Branch(t) | Flow::Call(t) = i.flow {
+                if (t & !1) < a || (t & !1) >= b {
+                    dense_out.push((pc, t));
+                }
+            }
+        }
+    }
+    for &(pc, t) in &dense_out {
+        if funcs.contains_key(&t) || extra_entries.contains_key(&t) {
+            continue;
+        }
+        match owner.get(&(t & !1)) {
+            Some(&fe) if fe & 1 == t & 1 => {
+                extra_entries.insert(t, fe);
+                funcs.get_mut(&fe).unwrap().leaders.insert(t & !1);
+                extra += 1;
+            }
+            // fora do .text = dado no meio do assembly lido como instrução (tabelas do decodificador)
+            _ if !img.key_in_text(t) => {}
+            _ => eprintln!("[aviso] região densa: salto em {pc:#x} para {t:#x}, que não está em nenhuma função"),
+        }
+    }
     for f in funcs.values() {
         for &a in f.insts.keys() {
             if let Some(v) = literal_at(&img, a, f.entry & 1 == 1) {
@@ -644,7 +672,10 @@ fn main() {
     // 4. emissão
     std::fs::create_dir_all(&out).unwrap();
     write_if_changed(out.join("stats.txt"), &report).unwrap();
-    let list: Vec<&Func> = funcs.values().collect();
+    // as regiões densas (assembly com milhares de blocos numa função) vão num crate só delas, compilado com menos
+    // otimização: o LLVM leva muito tempo nelas em opt-level 2
+    let dense_keys: BTreeSet<u32> = regions.iter().map(|r| r.0).collect();
+    let list: Vec<&Func> = funcs.values().filter(|f| !dense_keys.contains(&f.entry)).collect();
     let per = ninst.div_ceil(ncrates.max(1));
     let mut slices: Vec<Vec<&Func>> = vec![Vec::new()];
     let mut acc = 0;
@@ -656,6 +687,8 @@ fn main() {
         acc += f.insts.len();
         slices.last_mut().unwrap().push(f);
     }
+    let dense_slice = slices.len();
+    slices.push(funcs.values().filter(|f| dense_keys.contains(&f.entry)).collect());
     let crate_of: HashMap<u32, usize> = slices
         .iter()
         .enumerate()
@@ -680,7 +713,7 @@ fn main() {
         )
         .unwrap();
         let mut src = String::with_capacity(per * 120);
-        src.push_str("//! Gerado por yw1-recomp a partir do code.bin do usuário — não editar, não versionar.\n#![allow(unused, unreachable_code, unused_unsafe, non_snake_case, clippy::all)]\nuse yw1_rt::{self as rt, Cpu};\n\n");
+        src.push_str("//! Gerado por yw1-recomp a partir do code.bin do usuário — não editar, não versionar.\n#![allow(unused, unreachable_code, unused_unsafe, non_snake_case, clippy::all)]\nuse yw1_rt::{self as rt, Cpu};\n\n/// pc devolvido pelos pedaços de uma função gigante quando ela retorna\nconst DONE: u32 = u32::MAX;\n\n");
         let mut ext = BTreeSet::new();
         let mut body = String::new();
         for f in s {
@@ -763,6 +796,8 @@ fn main() {
         writeln!(ws, "    \"{m}\",").unwrap();
     }
     ws.push_str("]\n\n[profile.release]\nopt-level = 2\ncodegen-units = 16\ndebug = false\nincremental = false\n\n[profile.dev]\nopt-level = 1\n");
+    // as regiões densas ficam no último crate (`dense_slice`), partidas em pedaços: compilam no opt-level normal
+    let _ = dense_slice;
     write_if_changed(out.join("Cargo.toml"), ws).unwrap();
     println!(
         "gerado em {} ({} crates) em {:.1}s",
@@ -811,17 +846,15 @@ fn emit_func(
     ext: &mut BTreeSet<u32>,
     out: &mut String,
 ) {
-    writeln!(
-        out,
-        "#[no_mangle]\npub fn f_{:08x}(c: &mut Cpu, mut pc: u32, ret: u32) {{\n    c.func = {:#x};\n    loop {{\n        match pc {{",
-        f.entry,
-        f.entry
-    )
-    .unwrap();
+    let mut blocks: Vec<(u32, String)> = Vec::new();
+    // região densa (todo endereço é bloco: assembly do decodificador de vídeo): sem checagem de preempção nos laços.
+    // Com ela, o LLVM levava >15 min só nessa função; o decodificador roda pouco por chamada e cede na entrada.
+    let dense = f.insts.len() > 256 && f.leaders.len() == f.insts.len();
     for &l in &f.leaders {
         if !f.insts.contains_key(&l) {
             continue;
         }
+        let out = &mut String::new();
         writeln!(out, "            {l:#x} => {{").unwrap();
         let mut pc = l;
         loop {
@@ -846,7 +879,10 @@ fn emit_func(
                     let intra = f.insts.contains_key(&ta)
                         && f.leaders.contains(&ta)
                         && (t == f.entry || !funcs.contains_key(&t));
-                    if intra {
+                    if intra && ta <= pc && !dense {
+                        // salto para trás (laço): ponto de checagem de preempção
+                        format!("rt::poll(c); pc = {ta:#x}; continue;")
+                    } else if intra {
                         format!("pc = {ta:#x}; continue;")
                     } else {
                         format!("{} return;", call_expr(t, "ret", funcs, crate_of, me, ext))
@@ -887,6 +923,58 @@ fn emit_func(
             pc = next;
         }
         out.push_str("            }\n");
+        blocks.push((l, std::mem::take(out)));
     }
-    out.push_str("            _ => { rt::jump(c, pc, ret); return; }\n        }\n    }\n}\n\n");
+    let head = format!(
+        "#[no_mangle]\npub fn f_{:08x}(c: &mut Cpu, mut pc: u32, ret: u32) {{\n    c.func = {:#x};\n    rt::poll(c);\n    loop {{\n",
+        f.entry, f.entry
+    );
+    if blocks.len() <= CHUNK_MAX {
+        out.push_str(&head);
+        out.push_str("        match pc {\n");
+        for (_, b) in &blocks {
+            out.push_str(b);
+        }
+        out.push_str("            _ => { rt::jump(c, pc, ret); return; }\n        }\n    }\n}\n\n");
+        return;
+    }
+    // Função gigante (o decodificador de vídeo em assembly tem ~19 mil blocos): um único `match` deixa o rustc
+    // superlinear (>25 min até em opt-level 0). Parte em pedaços de CHUNK blocos, cada um uma função com o próprio
+    // laço; um salto para fora do pedaço devolve o pc ao laço de cima, que escolhe o pedaço pela faixa de endereços.
+    // Retorno da função = DONE (ímpar e fora do .text: nunca é bloco).
+    let chunks: Vec<&[(u32, String)]> = blocks.chunks(CHUNK).collect();
+    let range = |k: usize| {
+        let lo = chunks[k][0].0;
+        let hi = chunks.get(k + 1).map(|n| n[0].0 - 1).unwrap_or(u32::MAX - 1);
+        (lo, hi)
+    };
+    out.push_str(&head);
+    out.push_str("        pc = match pc {\n");
+    for k in 0..chunks.len() {
+        let (lo, hi) = range(k);
+        writeln!(out, "            {lo:#x}..={hi:#x} => f_{:08x}_k{k}(c, pc, ret),", f.entry).unwrap();
+    }
+    out.push_str("            _ => { rt::jump(c, pc, ret); return; }\n        };\n        if pc == DONE { return; }\n    }\n}\n\n");
+    for (k, ch) in chunks.iter().enumerate() {
+        let (lo, hi) = range(k);
+        writeln!(
+            out,
+            "#[inline(never)]\nfn f_{:08x}_k{k}(c: &mut Cpu, mut pc: u32, ret: u32) -> u32 {{\n    loop {{\n        match pc {{",
+            f.entry
+        )
+        .unwrap();
+        for (_, b) in ch.iter() {
+            out.push_str(&b.replace("return;", "return DONE;"));
+        }
+        // pc dentro da faixa mas que não é bloco: mesmo tratamento do braço `_` de uma função normal
+        writeln!(
+            out,
+            "            {lo:#x}..={hi:#x} => {{ rt::jump(c, pc, ret); return DONE; }}\n            _ => return pc,\n        }}\n    }}\n}}\n"
+        )
+        .unwrap();
+    }
 }
+
+/// Funções com mais blocos que isto são partidas em pedaços de `CHUNK` blocos (ver `emit_func`).
+const CHUNK_MAX: usize = 1024;
+const CHUNK: usize = 384;

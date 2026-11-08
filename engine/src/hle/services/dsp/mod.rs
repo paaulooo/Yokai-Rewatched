@@ -17,7 +17,7 @@
 pub mod codec;
 pub mod layout;
 pub mod mixer;
-mod output;
+pub mod output;
 pub mod source;
 
 use super::{new_event, unknown, Ipc};
@@ -334,8 +334,13 @@ pub fn request(ipc: &Ipc) {
             ipc.ok(2, 0);
             ipc.set(2, v as u32);
         }
-        // SetSemaphore (nada no HLE) / GetSemaphore / ClearSemaphore
-        0x0007 | 0x0008 | 0x0009 => ipc.ok(1, 0),
+        // SetSemaphore / ClearSemaphore (nada no HLE)
+        0x0007 | 0x0009 => ipc.ok(1, 0),
+        // GetSemaphore → u16 do semáforo na palavra 2 (3dbrew "DSP Services"); o HLE não tem semáforo → 0
+        0x0008 => {
+            ipc.ok(2, 0);
+            ipc.set(2, 0);
+        }
         // ConvertProcessAddressFromDspDram(endereço)
         0x000c => {
             let a = ipc.get(1);
@@ -484,6 +489,10 @@ pub fn audio_frame() {
             None
         }
     };
+    {
+        let (r, sv, t8w) = crate::hle::kernel::diag_running();
+        if std::env::var_os("YW_DIAG").is_some() { eprintln!("[diag] run {:?} svc {:#x} t8wait {}", r, sv, t8w); }
+    }
     for e in ev {
         K.signal_external(e);
     }

@@ -64,6 +64,7 @@ fn swz(v: V4, sel: u32, neg: bool) -> V4 {
     o
 }
 
+#[derive(Clone, Copy, Default)]
 struct Frame {
     final_addr: u32,
     ret: u32,
@@ -72,6 +73,37 @@ struct Frame {
     loop_addr: u32,
     /// quadro de LOOP (BREAK/BREAKC saem do mais interno)
     looped: bool,
+}
+
+/// Pilha de CALL/IF/LOOP de tamanho fixo (sem alocar por vértice). O PICA tem 4 níveis de laço/chamada; 16 sobra.
+/// Estouro: o quadro mais antigo é descartado (o Citra limita a pilha do mesmo jeito) [H].
+struct Stack {
+    f: [Frame; 16],
+    n: usize,
+}
+
+impl Stack {
+    fn push(&mut self, fr: Frame) {
+        if self.n == self.f.len() {
+            self.f.copy_within(1.., 0);
+            self.n -= 1;
+        }
+        self.f[self.n] = fr;
+        self.n += 1;
+    }
+    fn last_mut(&mut self) -> Option<&mut Frame> {
+        self.n.checked_sub(1).map(|i| &mut self.f[i])
+    }
+    fn pop(&mut self) {
+        self.n = self.n.saturating_sub(1);
+    }
+    /// BREAK: tira até o laço mais interno (inclusive) e devolve o retorno dele.
+    fn brk(&mut self) -> Option<u32> {
+        let pos = self.f[..self.n].iter().rposition(|f| f.looped)?;
+        let r = self.f[pos].ret;
+        self.n = pos;
+        Some(r)
+    }
 }
 
 pub struct Exec<'a> {
@@ -152,7 +184,7 @@ impl<'a> Exec<'a> {
     /// Executa a partir do ponto de entrada até `END` (com limite de passos contra laços infinitos).
     pub fn run(&mut self) {
         let mut pc = self.p.entry;
-        let mut stack: Vec<Frame> = Vec::with_capacity(8);
+        let mut stack = Stack { f: [Frame::default(); 16], n: 0 };
         let mut steps = 0u32;
         loop {
             steps += 1;
@@ -175,7 +207,7 @@ impl<'a> Exec<'a> {
             let w = self.p.code[pc as usize];
             let op = w >> 26;
             let mut next = pc + 1;
-            let call = |stack: &mut Vec<Frame>, off: u32, num: u32, ret: u32, repeat: u8, incr: u8, looped: bool| {
+            let call = |stack: &mut Stack, off: u32, num: u32, ret: u32, repeat: u8, incr: u8, looped: bool| {
                 stack.push(Frame {
                     final_addr: off + num,
                     ret,
@@ -185,12 +217,6 @@ impl<'a> Exec<'a> {
                     looped,
                 });
                 off
-            };
-            let brk = |stack: &mut Vec<Frame>| -> Option<u32> {
-                let pos = stack.iter().rposition(|f| f.looped)?;
-                let r = stack[pos].ret;
-                stack.truncate(pos);
-                Some(r)
             };
             match op {
                 // formato 1 / 1i / CMP
@@ -284,7 +310,7 @@ impl<'a> Exec<'a> {
                 }
                 // BREAK: sai do laço mais interno
                 0x20 => {
-                    if let Some(r) = brk(&mut stack) {
+                    if let Some(r) = stack.brk() {
                         next = r;
                     }
                 }
@@ -293,7 +319,7 @@ impl<'a> Exec<'a> {
                 // BREAKC
                 0x23 => {
                     if self.cond(w) {
-                        if let Some(r) = brk(&mut stack) {
+                        if let Some(r) = stack.brk() {
                             next = r;
                         }
                     }

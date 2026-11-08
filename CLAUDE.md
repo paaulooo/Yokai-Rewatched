@@ -37,9 +37,14 @@ yokai-port/
 cd recomp && cargo run --release                         # gera work/recomp/ a partir de data/ghidra/code.bin
 cd work/recomp && cargo build --release -p yw1-recomp-app # executável yw1r (código do jogo + HLE + PICA)
 YW_HEADLESS_SECS=60 work/recomp/target/release/yw1r.exe   # sem janela; telas em work/recomp_frames/
+cd tools && python recomp_run.py NOME --secs 140 --input "24:a; +6:a"   # rodada com roteiro (YW_INPUT) + folha de contato
+python frames_sheet.py --dir ../work/runs/NOME --at 125   # uma captura em tamanho real (cima + baixo)
 cd engine && cargo test --release --lib -- --ignored pica_frame --nocapture   # renderizador vs captura do Azahar
 ```
 Código gerado = derivado do jogo → só em `work/`, nunca versionar. O motor manual abaixo está congelado.
+Meta atual: jogo recompilado jogável até o capítulo 3 (DX12 adiado). Janela do jogo recompilado: Esc/F1 = menu (configurações em
+%APPDATA%/yw1/settings.toml); o motor antigo abaixo continua com Esc = sair. Build travando = partir o código gerado em mais
+pedaços/crates, nunca baixar opt-level (ver docs/RECOMP.md "Funções gigantes são partidas").
 
 ## Runtime manual antigo (Rust, dentro de `engine/`, congelado)
 ```

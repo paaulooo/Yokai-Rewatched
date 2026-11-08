@@ -15,11 +15,24 @@ path = "src/main.rs"
 
 [dependencies]
 yw1-rt = { path = "../rt" }
+# janela do motor manual antigo (src/main.rs, congelado)
 minifb = "0.27"
 cpal = "0.15"
-gilrs = "0.11"
+gilrs = { version = "0.11", features = ["serde-serialize"] }
+# janela do jogo recompilado (src/hle/window.rs): winit + egui desenhado com wgpu (Vulkan, reserva DX12)
+winit = { version = "0.30.13", features = ["serde"] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard"] }
+egui-wgpu = { version = "0.37", default-features = false, features = ["winit"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "wgsl"] }
+pollster = "0.4"
+# configurações em %APPDATA%/yw1/settings.toml
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 # backend Vulkan do renderizador PICA (engine/src/render/vulkan.rs)
 ash = "0.38"
+# shader de vértice do PICA em paralelo (cada vértice é independente)
+rayon = "1.10"
 
 [profile.dev]
 opt-level = 1

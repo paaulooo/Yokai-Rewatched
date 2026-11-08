@@ -14,7 +14,6 @@ pub mod texture;
 use crate::hle::mem::pa_to_va;
 use raster::{Ctx, Stage, Vtx};
 use shader::{f24, unpack_f24x4, Exec, Program, V4};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use texture::Tex;
@@ -22,6 +21,20 @@ use yw1_rt::{r16, r32, r8};
 
 pub static LISTS: AtomicU64 = AtomicU64::new(0);
 pub static DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// Tempo gasto (ns, acumulado) em cada parte da renderização — o relatório sem janela mostra por segundo.
+/// 0 lista inteira · 1 shader de vértice (CPU) · 2 vulkan::draw · 3 sincronismo GPU↔memória (execução do lote e
+/// devolução preguiçosa, nos ganchos do GSP; fora da lista)
+/// · 4 DisplayTransfer · 5 MemoryFill
+pub static PROF: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Mede `f` e soma em `PROF[i]`.
+pub fn timed<R>(i: usize, f: impl FnOnce() -> R) -> R {
+    let t = std::time::Instant::now();
+    let r = f();
+    PROF[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
 
 /// `YW_RENDERER=none` desliga o desenho (só conta), para medir o resto do jogo; `vulkan` usa o backend de GPU
 /// (`crate::render`), `soft` (padrão) o rasterizador de referência deste módulo.
@@ -57,32 +70,50 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 /// Executa uma lista de comandos (endereço virtual guest, tamanho em bytes).
 pub fn execute(addr: u32, size: u32) {
+    let words = read_list(addr, size);
+    execute_words(&words);
+}
+
+/// Copia uma lista de comandos da memória guest (palavras de 32 bits; vazia se não mapeada).
+pub fn read_list(addr: u32, size: u32) -> Vec<u32> {
+    let n = (size / 4) as usize;
+    if n == 0 || !crate::hle::mem::is_mapped(addr) || !crate::hle::mem::is_mapped(addr + size - 1) {
+        return Vec::new();
+    }
+    (0..n as u32).map(|i| r32(addr + 4 * i)).collect()
+}
+
+/// Executa uma lista já copiada (a GPU assíncrona copia no despacho: o jogo pode reescrever o buffer depois).
+pub fn execute_words(words: &[u32]) {
+    timed(0, || execute_inner(words))
+}
+
+fn execute_inner(words: &[u32]) {
     LISTS.fetch_add(1, Ordering::Relaxed);
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(State::new);
     let draws_before = DRAWS.load(Ordering::Relaxed);
-    let mut p = addr;
-    let end = addr.wrapping_add(size);
-    while p + 8 <= end {
-        let first = r32(p);
-        let hdr = r32(p + 4);
+    let mut p = 0usize;
+    while p + 2 <= words.len() {
+        let first = words[p];
+        let hdr = words[p + 1];
         let id = hdr & 0xffff;
         let mask = (hdr >> 16) & 0xf;
-        let extra = (hdr >> 20) & 0xff;
+        let extra = ((hdr >> 20) & 0xff) as usize;
         let consecutive = hdr >> 31 != 0;
         for k in 0..=extra {
-            let val = if k == 0 { first } else { r32(p + 4 + 4 * k) };
-            let reg = if consecutive { id + k } else { id };
+            let val = if k == 0 { first } else { words.get(p + 1 + k).copied().unwrap_or(0) };
+            let reg = if consecutive { id + k as u32 } else { id };
             write_reg(st, reg, val, mask);
         }
-        p += 8 + 4 * extra;
+        p += 2 + extra;
         if extra % 2 == 1 {
-            p += 4;
+            p += 1;
         }
     }
     // backend de GPU: devolve os render targets para a memória guest antes do GSP continuar
     if DRAWS.load(Ordering::Relaxed) != draws_before {
-        crate::render::end_list();
+        timed(3, crate::render::end_list);
     }
 }
 
@@ -174,6 +205,42 @@ fn va(pa: u32) -> u32 {
 }
 
 /// Lê os atributos do vértice `index` dos 12 carregadores (Citra `vertex_loader.cpp`).
+fn debug_on() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("YW_PICA_DEBUG").is_some())
+}
+
+/// Os arranjos de vértices que o draw vai ler (índices `lo..=hi`) estão na memória mapeada?
+fn vertex_memory_ok(st: &State, lo: u32, hi: u32) -> bool {
+    let r = &st.regs;
+    let base = r[0x200] << 3;
+    for l in 0..12usize {
+        let off = r[0x203 + 3 * l];
+        let c_hi = r[0x205 + 3 * l];
+        let n = (c_hi >> 28) & 0xf;
+        let stride = (c_hi >> 16) & 0xff;
+        if n == 0 {
+            continue;
+        }
+        let a = va(base + off);
+        let first = a.wrapping_add(lo.wrapping_mul(stride));
+        let last = a.wrapping_add(hi.wrapping_add(1).wrapping_mul(stride.max(1))).wrapping_sub(1);
+        if !crate::hle::mem::is_mapped(first) || !crate::hle::mem::is_mapped(last) || last < first {
+            return false;
+        }
+    }
+    true
+}
+
+/// Draw descartado por dados inválidos: avisa (poucas vezes) e conta.
+fn bad_draw(why: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n.is_power_of_two() {
+        eprintln!("[pica] draw ignorado ({why}) — {} até agora", n + 1);
+    }
+}
+
 fn load_vertex(st: &State, index: u32, out: &mut [V4; 16]) {
     let r = &st.regs;
     let base = r[0x200] << 3;
@@ -379,7 +446,14 @@ fn draw(st: &mut State, indexed: bool) {
     let i16 = icfg >> 31 != 0;
     let first = r[0x22a];
     let topo = (r[0x25e] >> 8) & 3;
-    let debug = std::env::var_os("YW_PICA_DEBUG").is_some();
+    if indexed {
+        let bytes = if i16 { 2 * n } else { n };
+        if !crate::hle::mem::is_mapped(iaddr) || !crate::hle::mem::is_mapped(iaddr.wrapping_add(bytes - 1)) {
+            bad_draw("índices fora da memória mapeada");
+            return;
+        }
+    }
+    let debug = debug_on();
     if debug {
         for s in &raster::STATS {
             s.store(0, Ordering::Relaxed);
@@ -394,26 +468,59 @@ fn draw(st: &mut State, indexed: bool) {
             raster::triangle(&ctx, a, b, c);
         }
     };
-    let mut cache: HashMap<u32, Vtx> = HashMap::new();
+    // índices → vértices distintos (tabela densa pela faixa de índices) → shader de vértice em paralelo quando há
+    // muitos (cada vértice é independente; mesmo resultado bit a bit) → montagem de primitivas na ordem original
+    let idx: Vec<u32> = (0..n)
+        .map(|k| {
+            if indexed {
+                if i16 {
+                    r16(iaddr + 2 * k)
+                } else {
+                    r8(iaddr + k)
+                }
+            } else {
+                first + k
+            }
+        })
+        .collect();
+    let lo = idx.iter().copied().min().unwrap_or(0);
+    let hi = idx.iter().copied().max().unwrap_or(0);
+    // memória dos vértices mapeada? (com a GPU assíncrona o jogo pode ter reescrito o que a lista aponta; no console
+    // isso só leria lixo — aqui pula o draw em vez de derrubar o processo)
+    if !vertex_memory_ok(st, lo, hi) {
+        bad_draw("vértices fora da memória mapeada");
+        return;
+    }
+    let mut slot = vec![u32::MAX; (hi - lo) as usize + 1];
+    let mut uniq: Vec<u32> = Vec::new();
+    for &i in &idx {
+        let s = &mut slot[(i - lo) as usize];
+        if *s == u32::MAX {
+            *s = uniq.len() as u32;
+            uniq.push(i);
+        }
+    }
+    let st_ref: &State = st;
+    let shade = |&index: &u32| {
+        let mut e = Exec::new(&st_ref.vs);
+        load_vertex(st_ref, index, &mut e.input);
+        e.run();
+        output_vertex(st_ref, &e.out)
+    };
+    let shaded: Vec<Vtx> = timed(1, || {
+        if uniq.len() >= 96 {
+            use rayon::prelude::*;
+            uniq.par_iter().with_min_len(32).map(shade).collect()
+        } else {
+            uniq.iter().map(shade).collect()
+        }
+    });
+    let cache: Vec<Vtx> = shaded;
     let mut buf: [Vtx; 2] = [Vtx::default(); 2];
     let mut bi = 0usize;
     let mut ready = false;
-    for k in 0..n {
-        let index = if indexed {
-            if i16 {
-                r16(iaddr + 2 * k)
-            } else {
-                r8(iaddr + k)
-            }
-        } else {
-            first + k
-        };
-        let v = *cache.entry(index).or_insert_with(|| {
-            let mut e = Exec::new(&st.vs);
-            load_vertex(st, index, &mut e.input);
-            e.run();
-            output_vertex(st, &e.out)
-        });
+    for &index in &idx {
+        let v = cache[slot[(index - lo) as usize] as usize];
         // montagem de primitivas (Citra `primitive_assembly.cpp`)
         match topo {
             1 | 2 => {
@@ -436,11 +543,11 @@ fn draw(st: &mut State, indexed: bool) {
         }
     }
     if gpu {
-        crate::render::vulkan::draw(&ctx, &gpu_verts);
+        timed(2, || crate::render::vulkan::draw(&ctx, &gpu_verts));
     }
     if debug {
         let s: Vec<u64> = raster::STATS.iter().map(|x| x.load(Ordering::Relaxed)).collect();
-        let v0 = cache.values().next().copied().unwrap_or_default();
+        let v0 = cache.first().copied().unwrap_or_default();
         eprintln!(
             "[pica] draw n={n} topo={topo} entry={:#x} tri={} fora={} cull={} frag={} alfa={} sten={} prof={} escritos={} · v0 pos={:?} cor={:?} uv={:?} · z(esc={} off={} wbuf={}) dtest={} f={}",
             st.vs.entry, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], v0.pos, v0.color, v0.tc0, ctx.zscale, ctx.zoffset, ctx.wbuffer, ctx.depth_test, ctx.depth_func

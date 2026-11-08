@@ -8,7 +8,7 @@
 //! shadow/gas.
 
 use super::texture::{sample, Tex};
-use crate::hle::gpu::{read_pixel, tiled_offset, write_pixel};
+use crate::hle::gpu::{pica_color_fmt_to_gsp, read_pixel, tiled_offset, write_pixel};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use yw1_rt::{r16, r32, r8, w16, w32, w8};
 
@@ -483,8 +483,10 @@ fn fragment(c: &Ctx, x: u32, y: u32, v0: &Screen, v1: &Screen, v2: &Screen, bc: 
         _ => 2,
     };
     let caddr = c.color_addr + tiled_offset(x, fy, c.width, bpp);
+    // `color_fmt` está na numeração do PICA; read/write_pixel usam a do GSP (RGB5A1 e RGB565 trocados)
+    let pfmt = pica_color_fmt_to_gsp(c.color_fmt);
     let dst = if c.color_read {
-        read_pixel(caddr, c.color_fmt)
+        read_pixel(caddr, pfmt)
     } else {
         [0, 0, 0, 0]
     };
@@ -502,7 +504,7 @@ fn fragment(c: &Ctx, x: u32, y: u32, v0: &Screen, v1: &Screen, v2: &Screen, bc: 
         }
     }
     stat(7);
-    write_pixel(caddr, c.color_fmt, fin);
+    write_pixel(caddr, pfmt, fin);
 }
 
 fn test(func: u32, a: u32, b: u32) -> bool {

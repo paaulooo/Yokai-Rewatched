@@ -4,9 +4,14 @@
 //! cadencia sozinho esperando esses eventos. Sem desbloqueio de FPS por enquanto (pedido do Paulo).
 
 pub mod gpu;
+pub mod input;
 pub mod kernel;
 pub mod mem;
+pub mod menu;
+pub mod present;
+pub mod script;
 pub mod services;
+pub mod settings;
 pub mod window;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,8 +27,69 @@ const MAIN_PRIO: i32 = 0x30;
 const MAIN_STACK: u32 = 0x6000;
 
 static CRASH: Mutex<Option<String>> = Mutex::new(None);
+
+/// Fator do relógio do console. **Sempre 1 para jogar** (velocidade travada na normal, pedido do Paulo).
+/// `YW_SPEED=N` (0,25–8) só existe para os testes sem janela chegarem mais rápido longe no jogo: acelera por igual o
+/// VBlank, os quadros de áudio, o tick do sistema e os timeouts do kernel, então o jogo vê o mesmo tempo de console.
+pub fn speed() -> f64 {
+    static S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("YW_SPEED")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map_or(1.0, |v| v.clamp(0.25, 8.0))
+    })
+}
 static STARTED: AtomicBool = AtomicBool::new(false);
 pub static VBLANKS: AtomicU64 = AtomicU64::new(0);
+
+/// Pausa do console (menu da janela aberto): os relógios de VBlank e DSP param e, ao voltar, a base de tempo deles
+/// anda a duração da pausa (o jogo não "corre" para recuperar). `PAUSED_NS` = soma das pausas já terminadas.
+/// O kernel também desconta a pausa: `kernel::system_tick` (svc GetSystemTick) e os prazos de sleep/timeout usam
+/// `kernel::console_now()` = relógio do host − `paused_ns()`, então nada anda nem dispara enquanto o menu está aberto.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static PAUSE: Mutex<Option<Instant>> = Mutex::new(None);
+static PAUSED_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_paused(p: bool) {
+    let mut g = PAUSE.lock().unwrap();
+    match (p, *g) {
+        (true, None) => *g = Some(Instant::now()),
+        (false, Some(t)) => {
+            // soma antes de liberar: quem vê PAUSED = false já vê a pausa contada
+            PAUSED_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::SeqCst);
+            *g = None;
+        }
+        _ => return,
+    }
+    PAUSED.store(p, Ordering::SeqCst);
+}
+
+pub fn paused() -> bool {
+    PAUSED.load(Ordering::SeqCst)
+}
+
+/// Tempo total de pausa até agora (pausas terminadas + a que está em andamento), para quem precisar descontar do
+/// relógio do console (ex.: `kernel::system_tick`).
+pub fn paused_ns() -> u64 {
+    let g = PAUSE.lock().unwrap();
+    PAUSED_NS.load(Ordering::SeqCst) + g.map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+
+/// Espera o instante do `n`-ésimo evento de um relógio de `hz` (começado em `t0`), descontando as pausas.
+fn clock_wait(t0: Instant, n: u64, hz: f64) {
+    loop {
+        while paused() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let due = t0 + Duration::from_nanos(PAUSED_NS.load(Ordering::SeqCst)) + Duration::from_secs_f64(n as f64 / hz);
+        match due.checked_duration_since(Instant::now()) {
+            Some(d) => std::thread::sleep(d),
+            None if !paused() => return,
+            None => {}
+        }
+    }
+}
 
 /// Uma thread guest parou com erro (panic no código recompilado, ExitProcess…).
 pub fn crashed(msg: String) {
@@ -35,6 +101,12 @@ pub fn crashed(msg: String) {
 
 pub fn crash_message() -> Option<String> {
     CRASH.lock().unwrap().clone()
+}
+
+/// Ponto de preempção chamado pelo código recompilado (`rt::poll`) quando `rt::PREEMPT` está ligado.
+#[no_mangle]
+pub fn yw1_preempt(_c: &mut yw1_rt::Cpu) {
+    kernel::K.preempt_point();
 }
 
 /// Ponto de entrada das syscalls do código recompilado.
@@ -163,10 +235,7 @@ pub fn boot() {
             let mut n: u64 = 0;
             loop {
                 n += 1;
-                let due = t0 + Duration::from_secs_f64(n as f64 / VBLANK_HZ);
-                if let Some(d) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(d);
-                }
+                clock_wait(t0, n, VBLANK_HZ * speed());
                 services::gsp::interrupt(services::gsp::PDC0);
                 services::gsp::interrupt(services::gsp::PDC1);
                 services::hid::update(kernel::system_tick());
@@ -181,10 +250,7 @@ pub fn boot() {
             let mut n: u64 = 0;
             loop {
                 n += 1;
-                let due = t0 + Duration::from_secs_f64(n as f64 / AUDIO_HZ);
-                if let Some(d) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(d);
-                }
+                clock_wait(t0, n, AUDIO_HZ * speed());
                 services::dsp::audio_frame();
             }
         })
@@ -198,8 +264,10 @@ pub fn main() {
         run_headless(secs);
         std::process::exit(if crash_message().is_some() { 1 } else { 0 });
     }
+    // configurações (renderizador, idioma, volume) valem desde o início: lidas antes do boot
+    let cfg = window::Config::load();
     boot();
-    window::run();
+    window::run(cfg);
     if let Some(m) = crash_message() {
         eprintln!("[hle] o jogo parou: {m}
 [hle] threads:
@@ -211,20 +279,78 @@ pub fn main() {
 /// Roda sem janela por `seconds` e grava as telas em `work/recomp_frames/` (.rgba + tamanho no nome).
 pub fn run_headless(seconds: f64) {
     boot();
+    script::start_from_env();
+    if speed() != 1.0 {
+        eprintln!("[hle] relógio do console acelerado {}× (YW_SPEED, só para testes)", speed());
+    }
     let t0 = Instant::now();
-    let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../work/recomp_frames");
+    let out = std::env::var_os("YW_FRAMES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../work/recomp_frames"));
     let _ = std::fs::create_dir_all(&out);
-    let mut shot = 0;
+    // YW_SHOT_EVERY = intervalo entre capturas (s do console, padrão 0,5); nome = instante do console em décimos
+    let every: f64 = std::env::var("YW_SHOT_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+    let mut next_shot = every;
+    // a cada 5 s do console: quadros que o jogo apresentou por segundo (trocas da tela de cima) — a meta é 30
+    let (mut next_rate, mut last_swaps) = (5.0, 0u64);
+    let mut last_prof = [0u64; 6];
+    // vigia: sem quadro novo por 3 s do console → mostra a thread em execução algumas vezes
+    let (mut last_swap_count, mut last_swap_t, mut stall_dumps) = (0u64, 0.0f64, 0u32);
+    let mut last_host = Instant::now();
+    let mut last_idle = 0u64;
     while t0.elapsed().as_secs_f64() < seconds {
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(20));
         if let Some(m) = crash_message() {
             eprintln!("[hle] parou: {m}");
             break;
         }
-        shot += 1;
+        let t = VBLANKS.load(Ordering::Relaxed) as f64 / VBLANK_HZ;
+        let sw = services::gsp::SWAPS[0].load(Ordering::Relaxed);
+        if sw != last_swap_count {
+            (last_swap_count, last_swap_t, stall_dumps) = (sw, t, 0);
+        } else if t - last_swap_t > 3.0 + stall_dumps as f64 * 0.5 && stall_dumps < 12 {
+            stall_dumps += 1;
+            eprintln!("[vigia] {t:.1}s sem quadro novo: {}", kernel::running_snapshot());
+            if stall_dumps == 12 {
+                eprintln!("[vigia] threads:
+{}", kernel::threads_report());
+            }
+        }
+        if t >= next_rate {
+            let s = services::gsp::SWAPS[0].load(Ordering::Relaxed);
+            // fração do tempo do host (em %) gasta em: lista PICA, shader de vértice, vulkan::draw, devolução de RT,
+            // DisplayTransfer, MemoryFill
+            let host = last_host.elapsed().as_nanos().max(1) as f64;
+            let p: Vec<String> = crate::pica::PROF
+                .iter()
+                .zip(last_prof.iter_mut())
+                .map(|(a, l)| {
+                    let v = a.load(Ordering::Relaxed);
+                    let d = v - *l;
+                    *l = v;
+                    format!("{:.0}", d as f64 / host * 100.0)
+                })
+                .collect();
+            let idle_ns = kernel::IDLE_NS.load(Ordering::Relaxed);
+            let idle = (idle_ns - last_idle) as f64 / host * 100.0;
+            last_idle = idle_ns;
+            last_host = Instant::now();
+            eprintln!(
+                "[hle] {t:.0}s: {:.1} quadros/s do jogo · % do host: ocioso {idle:.0} · lista PICA {} (shader {} · vk draw {}) · sincronismo GPU {} · transfer {} · fill {} · resto (código do jogo, HLE) {:.0}",
+                (s - last_swaps) as f64 / 5.0,
+                p[0], p[1], p[2], p[3], p[4], p[5],
+                (100.0 - idle - p[0].parse::<f64>().unwrap_or(0.0) - p[3].parse::<f64>().unwrap_or(0.0) - p[4].parse::<f64>().unwrap_or(0.0) - p[5].parse::<f64>().unwrap_or(0.0)).max(0.0)
+            );
+            (next_rate, last_swaps) = (next_rate + 5.0, s);
+        }
+        if t < next_shot {
+            continue;
+        }
+        next_shot += every;
+        let shot = (t * 10.0).round() as u32;
         for s in 0..2 {
             if let Some((w, h, px)) = gpu::screen_rgba(s) {
-                let _ = std::fs::write(out.join(format!("t{shot:03}_s{s}_{w}x{h}.rgba")), px);
+                let _ = std::fs::write(out.join(format!("t{shot:05}_s{s}_{w}x{h}.rgba")), px);
             }
         }
     }
