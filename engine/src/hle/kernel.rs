@@ -454,6 +454,19 @@ pub fn running_snapshot() -> String {
     format!("t{tid} prio {} função {:#x} r={:08x?}", t.prio, c.func, &c.r)
 }
 
+/// (thread, prioridade, função guest atual, registradores) da thread em execução — só para diagnóstico (vigia).
+pub fn running_regs() -> Option<(usize, i32, u32, [u32; 16])> {
+    let g = K.lock();
+    let tid = g.running?;
+    let t = &g.threads[tid];
+    if t.cpu == 0 {
+        return None;
+    }
+    // SAFETY: Cpu da thread viva; leitura concorrente só para diagnóstico
+    let c = unsafe { &*(t.cpu as *const Cpu) };
+    Some((tid, t.prio as i32, c.func, c.r))
+}
+
 pub fn threads_report() -> String {
     let g = K.lock();
     let mut s = String::new();
@@ -592,7 +605,11 @@ pub fn svc(c: &mut Cpu, n: u32) {
                     c.r[1] = a;
                     c.r[0] = RESULT_OK;
                 }
-                1 => c.r[0] = RESULT_OK, // FREE: mantém o commit [H]
+                // FREE: mantém o commit [H] (só conta, para o mapa de memória)
+                1 => {
+                    mem::free(addr0, size);
+                    c.r[0] = RESULT_OK;
+                }
                 6 => c.r[0] = RESULT_OK, // PROTECT
                 _ => {
                     eprintln!("[svc] ControlMemory op {op:#x} não tratado");

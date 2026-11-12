@@ -28,14 +28,19 @@ pub struct Gsp {
     pub addr: u32,
     /// evento de interrupção que o jogo registrou (id do objeto)
     pub event: Option<usize>,
-    pub regs: Vec<u32>,
+    /// espelho dos registradores escritos por WriteHWRegs (índice = offset/4, até `REGS_LEN`), esparso: o jogo escreve
+    /// poucas dezenas; o vetor denso de antes comprometia 4 MB
+    pub regs: std::collections::BTreeMap<u32, u32>,
 }
+
+/// Índices de registrador guardados pelo espelho (0x400000 bytes de E/S + 0x4000 a mais, como o vetor de antes).
+const REGS_LEN: u32 = 0x0040_0000 / 4 + 0x1000;
 
 pub static GSP: Mutex<Gsp> = Mutex::new(Gsp {
     shared: 0,
     addr: 0,
     event: None,
-    regs: Vec::new(),
+    regs: std::collections::BTreeMap::new(),
 });
 
 pub fn mapped(addr: u32) {
@@ -78,24 +83,69 @@ pub fn interrupt(id: u8) {
 /// Trocas de framebuffer apresentadas por tela (quadros que o jogo mostrou).
 pub static SWAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Quantos VBlanks o jogo levou entre uma troca da tela de cima e a seguinte: [1, 2, 3, 4 ou mais] (a janela lê e zera a
+/// cada 5 s). A 30 quadros/s regulares tudo cai em 2; 2 e 3 misturados = o jogo tropeçando.
+pub static SWAP_VB: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
+static LAST_SWAP_VB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Saídas (endereço virtual) dos DisplayTransfers que estão na fila da thread "gpu" e ainda não rodaram.
+static PENDING_OUT: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Trocas de framebuffer adiadas um VBlank porque o buffer novo ainda tinha um DisplayTransfer na fila da GPU (a janela lê
+/// e zera a cada 5 s).
+pub static SWAPS_ADIADAS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `YW_SWAP_EARLY=1`: aplica a troca mesmo com o DisplayTransfer do buffer novo ainda na fila (comportamento antigo,
+/// só para comparar).
+fn swap_early() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("YW_SWAP_EARLY").is_ok_and(|v| v != "0"))
+}
+
 /// Copia a informação de framebuffer "suja" para o estado de apresentação.
+///
+/// A GPU daqui é uma thread do host que pode estar atrás do jogo: o jogo pede a troca para o buffer B logo depois de
+/// mandar o DisplayTransfer do quadro N para B, e o VBlank chega antes de a thread "gpu" executá-lo. Trocar ali mostraria
+/// B ainda com o quadro N−2 — a imagem volta um quadro e depois pula dois (o "vai e volta" ao andar). No console a
+/// transferência termina antes do VBlank; aqui a troca espera o próximo VBlank em que a transferência já rodou.
 fn update_framebuffer(addr: u32, screen: u32) {
     let b = addr + 0x200 + 0x40 * screen;
     let dirty = r8(b + 1);
-    if dirty == 0 {
+    // modo mono: o jogo não publica a troca da tela de cima; usa a sintetizada no último DisplayTransfer dela
+    let synth = if dirty == 0 && screen == 0 { gpu::take_synth_top() } else { None };
+    if dirty == 0 && synth.is_none() {
         return;
     }
-    let idx = r8(b) & 1;
-    let fb = b + 4 + 0x1c * idx;
-    let info = gpu::FbInfo {
-        active: r32(fb),
-        left: r32(fb + 4),
-        right: r32(fb + 8),
-        stride: r32(fb + 12),
-        format: r32(fb + 16),
+    let info = match synth {
+        Some(i) => i,
+        None => {
+            let idx = r8(b) & 1;
+            let fb = b + 4 + 0x1c * idx;
+            gpu::FbInfo { active: r32(fb), left: r32(fb + 4), right: r32(fb + 8), stride: r32(fb + 12), format: r32(fb + 16) }
+        }
     };
+    let left = crate::hle::mem::pa_to_va(info.left).unwrap_or(info.left);
+    // modo assíncrono: o present_hires_finish volta logo depois de enviar, e a imagem N× só é publicada quando a GPU
+    // termina (thread "vk-publica") — a troca espera também por ela, senão a janela mostraria o nativo
+    if !gpu_sync() && (PENDING_OUT.lock().unwrap().contains(&left) || crate::render::vulkan::publish_pending(left)) {
+        SWAPS_ADIADAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !swap_early() {
+            if let Some(i) = synth {
+                gpu::put_back_synth_top(i);
+            }
+            return; // fica "suja": o próximo VBlank tenta de novo
+        }
+    }
     gpu::set_framebuffer(screen, info);
     SWAPS[screen as usize & 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if screen == 0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let vb = crate::hle::VBLANKS.load(Relaxed);
+        let prev = LAST_SWAP_VB.swap(vb, Relaxed);
+        if prev != 0 && vb > prev {
+            SWAP_VB[((vb - prev) as usize).min(4) - 1].fetch_add(1, Relaxed);
+        }
+    }
     w8(b + 1, 0);
 }
 
@@ -107,13 +157,10 @@ pub fn request(ipc: &Ipc) {
             let size = ipc.get(2);
             let ptr = if ipc.cmd() == 0x0001 { ipc.get(4) } else { ipc.get(4) };
             let mut g = GSP.lock().unwrap();
-            if g.regs.is_empty() {
-                g.regs = vec![0; 0x0040_0000 / 4 + 0x1000];
-            }
             for i in 0..size / 4 {
-                let a = ((reg + 4 * i) / 4) as usize;
-                if a < g.regs.len() {
-                    g.regs[a] = r32(ptr + 4 * i);
+                let a = (reg + 4 * i) / 4;
+                if a < REGS_LEN {
+                    g.regs.insert(a, r32(ptr + 4 * i));
                 }
             }
             drop(g);
@@ -127,8 +174,8 @@ pub fn request(ipc: &Ipc) {
             let out = ipc.static_buf(0);
             let g = GSP.lock().unwrap();
             for i in 0..size / 4 {
-                let a = ((reg + 4 * i) / 4) as usize;
-                w32(out + 4 * i, g.regs.get(a).copied().unwrap_or(0));
+                let a = (reg + 4 * i) / 4;
+                w32(out + 4 * i, g.regs.get(&a).copied().unwrap_or(0));
             }
             ipc.ok(1, 2);
             ipc.set(2, (size << 14) | 2);
@@ -200,38 +247,47 @@ enum GxCmd {
     Copy([u32; 6]),
 }
 
-/// Executa um comando e devolve as interrupções que ele gera (na ordem).
-fn run_gx(c: GxCmd) -> &'static [u8] {
+/// Resto de um DisplayTransfer para depois do PPF (imagem N× / interpolação; ver `gpu::display_transfer_native`).
+type Post = Option<crate::render::vulkan::PresentChecked>;
+
+/// Executa a parte nativa de um comando e devolve as interrupções que ele gera (na ordem) e o que sobra para depois
+/// delas (só DisplayTransfer com imagem N×).
+fn run_gx(c: GxCmd) -> (&'static [u8], Post) {
     match c {
         GxCmd::Dma(src, dst, size) => {
+            // o que só existe na GPU (superfícies pendentes) volta à memória antes de ser lido; no destino, o que a
+            // cópia sobrescreve por inteiro é descartado e o resto devolvido — senão a devolução preguiçosa
+            // posterior estragaria o que o DMA escreveu (texturas de interface corrompidas)
+            crate::render::before_read(src, src.wrapping_add(size));
+            crate::render::before_write(dst, dst.wrapping_add(size));
             let mut buf = vec![0u8; size as usize];
             yw1_rt::read_bytes(src, &mut buf);
             if mem::is_mapped(dst) {
                 yw1_rt::write_bytes(dst, &buf);
             }
-            &[DMA]
+            (&[DMA], None)
         }
         GxCmd::List(a, n, words) => {
             gpu::submit_cmdlist_words(a, n, &words);
-            &[P3D]
+            (&[P3D], None)
         }
         GxCmd::Fill(p) => {
             let control = p[6];
             gpu::memory_fill(p[0], p[1], p[2], control & 0xffff);
             if p[3] != 0 {
                 gpu::memory_fill(p[3], p[4], p[5], control >> 16);
-                &[PSC0, PSC1]
+                (&[PSC0, PSC1], None)
             } else {
-                &[PSC0]
+                (&[PSC0], None)
             }
         }
         GxCmd::Transfer(p) => {
-            gpu::display_transfer(p[0], p[1], p[2], p[3], p[4]);
-            &[PPF]
+            let post = gpu::display_transfer_native(p[0], p[1], p[2], p[3], p[4]);
+            (&[PPF], post)
         }
         GxCmd::Copy(p) => {
             gpu::texture_copy(p[0], p[1], p[2], p[3], p[4], p[5]);
-            &[PPF]
+            (&[PPF], None)
         }
     }
 }
@@ -248,12 +304,52 @@ fn gpu_sync() -> bool {
 /// espera de VBlank virava 3 períodos (20 quadros/s) em vez de 2 (30).
 static GX: Mutex<Option<std::sync::mpsc::Sender<GxCmd>>> = Mutex::new(None);
 
+/// Tempo (ns) que a "GPU" passou executando comandos do GX (soma desde o boot), incluindo a parte pós-PPF do
+/// DisplayTransfer: a interpolação de quadros desconta disto o tempo dos próprios intermediários (que rodam dentro da
+/// parte pós) e o que sobra no período do jogo é o orçamento deles (`render/interp.rs`). Se esta soma deixasse de fora
+/// a parte pós, o desconto dos intermediários levaria o orçamento a zero.
+pub static GPU_BUSY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Só a parte pós-PPF do DisplayTransfer (imagem N×, intermediários da interpolação, publicação), também contida em
+/// `GPU_BUSY_NS`: a linha de desempenho mostra "pós-transfer" à parte.
+pub static GPU_POST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `YW_PPF_EARLY` (padrão ligado): o PPF de um DisplayTransfer é sinalizado ao jogo logo depois da parte nativa, e a
+/// imagem N× / intermediários rodam depois, com o jogo já seguindo. `YW_PPF_EARLY=0`: ordem antiga (tudo antes do PPF).
+fn ppf_early() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("YW_PPF_EARLY").map_or(true, |v| v != "0"))
+}
+
+fn run_timed(c: GxCmd) -> (&'static [u8], Post) {
+    let t = std::time::Instant::now();
+    let r = run_gx(c);
+    GPU_BUSY_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// A parte pós-PPF de um DisplayTransfer (se houver).
+fn run_post(post: Post) {
+    let Some(c) = post else { return };
+    let t = std::time::Instant::now();
+    crate::render::present_hires_finish(c);
+    let ns = t.elapsed().as_nanos() as u64;
+    GPU_BUSY_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    GPU_POST_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn dispatch(c: GxCmd) {
     if gpu_sync() {
-        for &i in run_gx(c) {
+        // na thread do jogo, que de qualquer forma só segue depois de tudo: ordem antiga (adiantar o PPF não ganha nada)
+        let (ints, post) = run_timed(c);
+        run_post(post);
+        for &i in ints {
             interrupt(i);
         }
         return;
+    }
+    if let GxCmd::Transfer(p) = &c {
+        PENDING_OUT.lock().unwrap().push(p[1]);
     }
     let mut g = GX.lock().unwrap();
     let tx = g.get_or_insert_with(|| {
@@ -261,9 +357,35 @@ fn dispatch(c: GxCmd) {
         std::thread::Builder::new()
             .name("gpu".into())
             .spawn(move || {
+                // Ordem com o PPF adiantado: parte nativa → PPF (o jogo segue) → parte pós (imagem N×, intermediários)
+                // → sai de PENDING_OUT. A saída só deixa PENDING_OUT depois da parte pós: a troca de framebuffer para
+                // ela (`update_framebuffer`) continua esperando a imagem N× ser publicada — trocar antes faria a janela
+                // mostrar o nativo (o hash da imagem N× anterior desse buffer não confere mais) e quebraria a cadência
+                // da interpolação, que se ancora na troca.
                 for c in rx {
-                    for &i in run_gx(c) {
-                        interrupt(i);
+                    let out = if let GxCmd::Transfer(p) = &c { Some(p[1]) } else { None };
+                    let (ints, post) = run_timed(c);
+                    let done = || {
+                        if let Some(o) = out {
+                            let mut v = PENDING_OUT.lock().unwrap();
+                            if let Some(i) = v.iter().position(|&a| a == o) {
+                                v.remove(i);
+                            }
+                        }
+                    };
+                    if ppf_early() {
+                        for &i in ints {
+                            interrupt(i);
+                        }
+                        run_post(post);
+                        done();
+                    } else {
+                        // ordem antiga: tudo pronto, sai da fila e só então o PPF
+                        run_post(post);
+                        done();
+                        for &i in ints {
+                            interrupt(i);
+                        }
                     }
                 }
             })

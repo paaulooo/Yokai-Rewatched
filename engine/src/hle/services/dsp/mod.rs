@@ -88,6 +88,50 @@ impl SampleMemory for GuestMem {
 
 // ------------------------------------------------------------ núcleo (fontes + mixers)
 
+/// Histórico curto das mudanças no estado que o DSP devolve ao jogo (buffer atual/último, dirty, ligado) por fonte:
+/// é o que a biblioteca de áudio do jogo lê para decidir que um buffer terminou e pode ser reutilizado. O vigia o
+/// despeja no `stall.log` quando o jogo trava (ver `hle::watchdog`).
+static HISTORY: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_status(src: usize, enabled: bool, dirty: bool, cur: u16, last: u16) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static PREV: std::sync::Mutex<[(bool, bool, u16, u16); 24]> = std::sync::Mutex::new([(false, false, 0, 0); 24]);
+    if src >= 24 {
+        return;
+    }
+    let now = (enabled, dirty, cur, last);
+    let mut p = PREV.lock().unwrap_or_else(|e| e.into_inner());
+    if p[src] == now {
+        return;
+    }
+    let old = p[src];
+    p[src] = now;
+    drop(p);
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if h.len() >= 400 {
+        h.pop_front();
+    }
+    h.push_back(format!(
+        "quadro {} fonte {src:2}: ligada {}→{} dirty {}→{} atual {}→{} último {}→{}",
+        FRAMES.load(Relaxed),
+        old.0 as u8,
+        enabled as u8,
+        old.1 as u8,
+        dirty as u8,
+        old.2,
+        cur,
+        old.3,
+        last
+    ));
+}
+
+/// Últimas mudanças de estado do DSP (mais antigas primeiro).
+pub fn history() -> Vec<String> {
+    HISTORY.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+}
+
 /// Região que o DSP lê: a de `frame_counter` maior, tratando a volta de 0xFFFF (`CurrentRegionIndex`).
 pub fn current_region(fc0: u16, fc1: u16) -> usize {
     if fc0 == 0xffff && fc1 != 0xfffe {
@@ -107,21 +151,70 @@ pub fn current_region(fc0: u16, fc1: u16) -> usize {
 pub struct Core {
     pub sources: Vec<Source>,
     mixers: mixer::Mixers,
+    /// região que o último quadro leu (a de `frame_counter` mais novo): se não mudou, o jogo ainda não publicou nada
+    /// novo desde aquele quadro
+    last_ri: Option<usize>,
+    /// ticks seguidos em que o quadro foi segurado esperando o jogo
+    held: u32,
+    /// por fonte: houve pulso `buffer_id_dirty` em quadro segurado ainda não entregue ao jogo
+    pend_dirty: [bool; 24],
 }
+
+/// Quantos ticks (4,1 ms cada) o DSP espera o jogo publicar uma região nova antes de gerar o quadro mesmo assim.
+pub const MAX_HELD_TICKS: u32 = 8;
 
 impl Default for Core {
     fn default() -> Self {
-        Core { sources: (0..NUM_SOURCES).map(Source::new).collect(), mixers: mixer::Mixers::default() }
+        Core { sources: (0..NUM_SOURCES).map(Source::new).collect(), mixers: mixer::Mixers::default(), last_ri: None, held: 0, pend_dirty: [false; 24] }
     }
 }
 
 impl Core {
     /// Um quadro de áudio completo (`GenerateCurrentFrame`). Devolve a mixagem final.
+    /// Contrapressão: o jogo ainda está tratando o quadro anterior? O `frame_counter` é dele: ele o incrementa depois de
+    /// publicar a configuração que respondeu ao status, então enquanto a região de contador mais novo continua a mesma do
+    /// último quadro, ele ainda não terminou. Gerar outro quadro agora reescreveria o status na região que a thread do
+    /// jogo pode estar lendo (no hardware o tratador roda em < 1 ms com prioridade alta; aqui uma preempção do host o
+    /// alonga e o jogo leria um status de dois quadros: fontes 0 e 1 em momentos diferentes, fila de buffers de áudio
+    /// inconsistente, ciclo na lista). Segura até `MAX_HELD_TICKS` ticks; depois gera mesmo assim (jogo parado).
+    pub fn guest_still_busy(&mut self, ram: &mut dyn DspRam) -> bool {
+        let Some(last) = self.last_ri else { return false };
+        // YW_DSP_NOHOLD=1: sem contrapressão (comparação / reproduzir o defeito)
+        static NOHOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NOHOLD.get_or_init(|| std::env::var("YW_DSP_NOHOLD").is_ok_and(|v| v != "0")) {
+            return false;
+        }
+        let mut fc = [0u8; 4];
+        ram.read(REGION0 + FRAME_COUNTER, &mut fc[..2]);
+        ram.read(REGION1 + FRAME_COUNTER, &mut fc[2..]);
+        if current_region(rd16(&fc, 0), rd16(&fc, 2)) != last {
+            return false; // o jogo publicou uma região nova: respondeu ao quadro anterior
+        }
+        if self.held >= MAX_HELD_TICKS {
+            return false;
+        }
+        self.held += 1;
+        true
+    }
+
     pub fn generate_frame(&mut self, ram: &mut dyn DspRam, mem: &dyn SampleMemory) -> Frame {
+        self.generate_frame_ex(ram, mem, true)
+    }
+
+    /// Um quadro do DSP. Com `publish = false` (o jogo ainda trata o quadro anterior, ver `guest_still_busy`) o áudio é
+    /// gerado e mixado normalmente e as configurações são consumidas, mas NADA é escrito na região de saída (status,
+    /// amostras, mixers): o jogo continua vendo um quadro inteiro e consistente. Os pulsos `buffer_id_dirty` desses quadros
+    /// ficam em `pend_dirty` e saem no próximo quadro publicado (o tratador do jogo anda a fila até o buffer atual).
+    pub fn generate_frame_ex(&mut self, ram: &mut dyn DspRam, mem: &dyn SampleMemory, publish: bool) -> Frame {
+        FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut fc = [0u8; 4];
         ram.read(REGION0 + FRAME_COUNTER, &mut fc[..2]);
         ram.read(REGION1 + FRAME_COUNTER, &mut fc[2..]);
         let ri = current_region(rd16(&fc, 0), rd16(&fc, 2));
+        if publish {
+            self.last_ri = Some(ri);
+            self.held = 0;
+        }
         let (rb, wb) = if ri == 0 { (REGION0, REGION1) } else { (REGION1, REGION0) };
 
         // cópia da região lida; só os campos que o DSP altera (dirty flags) voltam para ela
@@ -137,18 +230,25 @@ impl Core {
             for (k, c) in coeffs.iter_mut().enumerate() {
                 *c = rd16(&snap, ADPCM_COEFFS + i * 32 + 2 * k) as i16;
             }
-            let st = s.tick(&mut snap[off..off + SOURCE_CONFIG_ONE], &coeffs, mem);
+            let mut st = s.tick(&mut snap[off..off + SOURCE_CONFIG_ONE], &coeffs, mem);
+            if self.pend_dirty[i] {
+                st.buffer_id_dirty = true;
+            }
+            self.pend_dirty[i] = !publish && st.buffer_id_dirty;
             if had_dirty {
                 ram.write(rb + off + src::DIRTY, &snap[off + src::DIRTY..off + src::DIRTY + 4]);
                 let b = off + src::BUFFERS_DIRTY;
                 ram.write(rb + b, &snap[b..b + 2]);
             }
             st.write(&mut statuses[i * SOURCE_STATUS_ONE..(i + 1) * SOURCE_STATUS_ONE]);
+            note_status(i, st.is_enabled, st.buffer_id_dirty, st.current_buffer_id, st.last_buffer_id);
             for (m, q) in quads.iter_mut().enumerate() {
                 s.mix_into(q, m);
             }
         }
-        ram.write(wb + SOURCE_STATUS, &statuses);
+        if publish {
+            ram.write(wb + SOURCE_STATUS, &statuses);
+        }
 
         let had_dirty = rd32(&snap, DSP_CONFIG + cfg::DIRTY) != 0;
         let (a, b) = snap.split_at_mut(INTERMEDIATE);
@@ -164,20 +264,24 @@ impl Core {
             }
         }
         for (m, w) in wrote.iter().enumerate() {
-            if *w {
+            if *w && publish {
                 let o = m * INTERMEDIATE_SIZE / 2;
                 ram.write(wb + INTERMEDIATE + o, &write_inter[o..o + INTERMEDIATE_SIZE / 2]);
             }
         }
         // DspStatus: unknown = 0, dropped_frames = 0
-        ram.write(wb + DSP_STATUS, &[0; 4]);
+        if publish {
+            ram.write(wb + DSP_STATUS, &[0; 4]);
+        }
         let out = *self.mixers.output();
         let mut fin = [0u8; FINAL_SAMPLES_SIZE];
         for (i, s) in out.iter().enumerate() {
             fin[4 * i..4 * i + 2].copy_from_slice(&s[0].to_le_bytes());
             fin[4 * i + 2..4 * i + 4].copy_from_slice(&s[1].to_le_bytes());
         }
-        ram.write(wb + FINAL_SAMPLES, &fin);
+        if publish {
+            ram.write(wb + FINAL_SAMPLES, &fin);
+        }
         out
     }
 }
@@ -194,6 +298,8 @@ enum Power {
 #[derive(Default)]
 struct Stats {
     frames: u64,
+    /// ticks em que o quadro foi segurado esperando o jogo terminar o anterior (contrapressão)
+    held: u64,
     max_playing: usize,
     playing_mask: u32,
     peak: i32,
@@ -469,8 +575,15 @@ pub fn audio_frame() {
             }
         }
         if d.power == Power::On {
-            let f = d.core.generate_frame(&mut GuestDspRam, &GuestMem);
-            ev.extend(d.int_pipe[PIPE_AUDIO]);
+            // contrapressão: o jogo ainda trata o quadro anterior → este quadro gera áudio, mas não publica nem interrompe
+            let publish = !d.core.guest_still_busy(&mut GuestDspRam);
+            if !publish {
+                d.stats.held += 1;
+            }
+            let f = d.core.generate_frame_ex(&mut GuestDspRam, &GuestMem, publish);
+            if publish {
+                ev.extend(d.int_pipe[PIPE_AUDIO]);
+            }
             let st = &mut d.stats;
             st.frames += 1;
             let mut n = 0;
@@ -583,8 +696,8 @@ fn print_stats() {
     };
     let current: usize = d.core.sources.iter().filter(|s| s.playing()).count();
     eprintln!(
-        "[dsp] {:?} · quadros {} · fontes tocando {} (máx {} no último s, ids {}) · pico {} ({:.1} dBFS) · {}",
-        d.power, st.frames, current, st.max_playing, ids.join(" "), st.peak, db, out
+        "[dsp] {:?} · quadros {} (segurados esperando o jogo: {}) · fontes tocando {} (máx {} no último s, ids {}) · pico {} ({:.1} dBFS) · {}",
+        d.power, st.frames, st.held, current, st.max_playing, ids.join(" "), st.peak, db, out
     );
     st.last_print = Some(now);
     st.max_playing = 0;
@@ -689,6 +802,56 @@ mod tests {
         assert_eq!(rd16(&ram.0, s + status::LAST_BUFFER_ID), 7);
         assert_eq!(rd16(&ram.0, s + status::CURRENT_BUFFER_ID), 0);
         assert_eq!(ram.0[s + status::BUFFER_ID_DIRTY], 1);
+    }
+
+    /// Contrapressão (`publish = false`): com o jogo ainda tratando o quadro anterior, o DSP continua gerando áudio (a
+    /// fonte avança e toca), mas não escreve nada na região de saída — o jogo vê um status inteiro e antigo — e o pulso
+    /// `buffer_id_dirty` do desligamento (que aconteceu num quadro segurado) sai no próximo quadro publicado.
+    #[test]
+    fn held_frames_keep_audio_and_defer_status() {
+        let mut ram = VecRam(vec![0; DSP_RAM_SIZE]);
+        let mem = VecMem((0..400u32).flat_map(|_| 1000i16.to_le_bytes()).collect());
+        wr16(&mut ram.0, REGION0 + FRAME_COUNTER, 3);
+        wr16(&mut ram.0, REGION1 + FRAME_COUNTER, 2);
+        let c = REGION0 + SOURCE_CONFIG;
+        let r = &mut ram.0;
+        let dirty = src::ENABLE_DIRTY | src::GAIN0_DIRTY | src::RATE_DIRTY | src::INTERP_DIRTY | src::FORMAT_DIRTY
+            | src::MONO_STEREO_DIRTY | src::EMBEDDED_DIRTY;
+        wr32(r, c + src::DIRTY, dirty);
+        r[c + src::ENABLE] = 1;
+        wr32(r, c + src::GAIN, 1f32.to_bits());
+        wr32(r, c + src::GAIN + 4, 1f32.to_bits());
+        wr32(r, c + src::RATE, 1f32.to_bits());
+        r[c + src::INTERP] = 1;
+        wr16(r, c + src::FLAGS1, (source::FMT_PCM16 << 2) | 1);
+        wr32d(r, c + src::PHYS_ADDR, 0x2000_0000);
+        wr32d(r, c + src::LENGTH, 400);
+        wr16(r, c + src::BUFFER_ID, 7);
+        let d = REGION0 + DSP_CONFIG;
+        wr32(r, d + cfg::DIRTY, cfg::MASTER_VOLUME_DIRTY);
+        wr32(r, d + cfg::MASTER_VOLUME, 1f32.to_bits());
+        let s = REGION1 + SOURCE_STATUS;
+
+        let mut core = Core::default();
+        core.generate_frame(&mut ram, &mem); // publicado: status inicial (buffer 7, posição 0)
+        assert_eq!(rd16(&ram.0, s + status::CURRENT_BUFFER_ID), 7);
+        let before = ram.0[REGION1..REGION1 + REGION_SIZE].to_vec();
+        // 4 quadros segurados: toca tudo (2 amostras de atraso + 400) e desliga
+        let mut heard = false;
+        for _ in 0..4 {
+            let f = core.generate_frame_ex(&mut ram, &mem, false);
+            heard |= f.iter().any(|x| *x == [1000, 1000]);
+        }
+        assert!(heard, "o áudio tem de continuar durante a contrapressão");
+        assert_eq!(&ram.0[REGION1..REGION1 + REGION_SIZE], &before[..], "nada pode ser escrito na região de saída enquanto segura");
+        // próximo quadro publicado: a fonte já desligou e o pulso dirty do desligamento chega
+        core.generate_frame(&mut ram, &mem);
+        assert_eq!(ram.0[s + status::IS_ENABLED], 0);
+        assert_eq!(rd16(&ram.0, s + status::LAST_BUFFER_ID), 7);
+        assert_eq!(ram.0[s + status::BUFFER_ID_DIRTY], 1, "o pulso dirty de um quadro segurado não pode se perder");
+        // e o pulso é de um quadro só
+        core.generate_frame(&mut ram, &mem);
+        assert_eq!(ram.0[s + status::BUFFER_ID_DIRTY], 0);
     }
 
     /// Rampa de ganho: ao mudar o ganho, o quadro vai linearmente do ganho antigo ao novo.

@@ -141,6 +141,183 @@ pub fn host_ptr(a: u32) -> *mut u8 {
 /// prioridade maior que a que está rodando. O código gerado checa em saltos para trás e na entrada de função.
 pub static PREEMPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 3D estéreo ligado? Desligado (padrão), o gancho "antes" do motor em `FUN_00114588` (inicialização do vídeo,
+/// `engine/src/hle/mod.rs`, `boot`) zera o byte de configuração que faz o jogo chamar `nngxSetDisplayMode(0x702)`: o
+/// jogo fica no modo 0x700 e desenha um olho só. O HLE define antes do primeiro quadro (`graficos.estereo_3d`,
+/// `YW_STEREO`).
+static STEREO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn stereo() -> bool {
+    STEREO.load(Ordering::Relaxed)
+}
+
+pub fn set_stereo(on: bool) {
+    STEREO.store(on, Ordering::Relaxed);
+}
+
+/// Uma proteção do gerador (`recomp/src/main.rs`, `GUARDS`) impediu uma instrução que corromperia o estado do jogo.
+/// Avisa nas primeiras vezes (`[guard]` no log) para dar para saber, depois, se ela chegou a ser necessária.
+#[cold]
+#[inline(never)]
+pub fn guard_hit(va: u32) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 5 {
+        eprintln!("[guard] proteção em {va:#x} acionada ({n}ª vez); últimas chamadas da fila de áudio:
+{}", trace_dump(200));
+    }
+}
+
+// ------------------------------------------------------------------- rastreio de chamadas (depuração)
+
+const TRACE_N: usize = 1024;
+const TRACE_W: usize = 8;
+static TRACE_BUF: [std::sync::atomic::AtomicU32; TRACE_N * TRACE_W] = [const { std::sync::atomic::AtomicU32::new(0) }; TRACE_N * TRACE_W];
+static TRACE_POS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Registra uma chamada de função do jogo num anel sem bloqueio: (µs, TLS da thread, etiqueta, 5 valores).
+/// As sondas ficam em `recomp/src/main.rs` (`TRACES`) e só existem em funções escolhidas (a fila de buffers de áudio).
+#[inline(never)]
+pub fn trace(c: &Cpu, tag: u32, a: u32, b: u32, d: u32, e: u32, f: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let us = T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u32;
+    let n = TRACE_POS.fetch_add(1, Relaxed);
+    let base = (n as usize % TRACE_N) * TRACE_W;
+    for (i, v) in [us, c.tls, tag, a, b, d, e, f].into_iter().enumerate() {
+        TRACE_BUF[base + i].store(v, Relaxed);
+    }
+}
+
+static AUDIO_VIOLATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn peek(a: u32, n: u32) -> Option<u32> {
+    // SAFETY: só pergunta ao motor se o endereço guest está mapeado
+    if a < 0x1000 || !unsafe { yw1_is_mapped(a) } || !unsafe { yw1_is_mapped(a.wrapping_add(n - 1)) } {
+        return None;
+    }
+    Some(match n {
+        1 => r8(a),
+        2 => r16(a),
+        _ => r32(a),
+    })
+}
+
+/// Verificador de invariantes da fila de buffers de áudio do SDK (depuração; ver `recomp/src/main.rs`, `TRACES`).
+/// Chamado na ENTRADA de `FUN_00141f40` (status do DSP) e `FUN_0014214c` (atualização) com a fila `q`
+/// (+0x30 cabeça, +0x34 contagem enviada ao DSP, +0x70 lock recursivo com dono em +4 e profundidade em +8; nó: +0x14
+/// próximo, +0x11 estado: 1 na fila, 2 tocando, 3 livre). Fora da seção crítica de outra thread, a fila tem de ter:
+/// sem ciclo, cabeça com estado 1/2 (nunca 3 = livre) e contagem ≤ tamanho da lista. Ao detectar, imprime uma vez
+/// (até 4 vezes) o que está errado e o histórico de chamadas — o primeiro momento de inconsistência, bem antes da queda.
+pub fn audio_check(c: &Cpu, q: u32, onde: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (Some(depth), Some(owner)) = (peek(q.wrapping_add(0x78), 4), peek(q.wrapping_add(0x74), 4)) else { return };
+    if depth != 0 && owner != c.tls {
+        return; // outra thread está dentro da seção crítica: o estado pode estar no meio de uma mudança
+    }
+    let (Some(head), Some(count)) = (peek(q.wrapping_add(0x30), 4), peek(q.wrapping_add(0x34), 2)) else { return };
+    let mut len = 0u32;
+    let mut n = head;
+    let mut seen = [0u32; 40];
+    let mut why = String::new();
+    while n != 0 && len < 40 {
+        if seen[..len as usize].contains(&n) {
+            why = format!("CICLO na lista (nó {n:08x} repetido após {len} nós)");
+            break;
+        }
+        seen[len as usize] = n;
+        len += 1;
+        match peek(n.wrapping_add(0x14), 4) {
+            Some(next) => n = next,
+            None => {
+                why = format!("nó {n:08x} com ponteiro de lista inválido");
+                break;
+            }
+        }
+    }
+    if why.is_empty() {
+        let hs = if head != 0 { peek(head.wrapping_add(0x11), 1).unwrap_or(0xff) } else { 1 };
+        if head != 0 && hs == 3 {
+            why = format!("cabeça {head:08x} com estado 3 (livre) ainda na lista");
+        } else if (count as i16) < 0 || count as u32 > len {
+            why = format!("contagem {} maior que o tamanho da lista ({len})", count as i16);
+        }
+    }
+    if !why.is_empty() && AUDIO_VIOLATIONS.fetch_add(1, Relaxed) < 4 {
+        eprintln!(
+            "[fila] INCONSISTENTE ao entrar em {onde} (fila {q:08x}, thread tls {:08x}): {why}\n  cabeça {head:08x} contagem {} tamanho {len}\n{}",
+            c.tls,
+            count as i16,
+            trace_dump(160)
+        );
+    }
+}
+
+/// Reenfileirar um nó que ainda está na fila (estado 1 ou 2) é o início do ciclo `nó.próximo = nó`: denuncia.
+pub fn audio_enqueue_check(c: &Cpu, q: u32, node: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(st) = peek(node.wrapping_add(0x11), 1) else { return };
+    if (st == 1 || st == 2) && AUDIO_VIOLATIONS.fetch_add(1, Relaxed) < 4 {
+        eprintln!(
+            "[fila] REENFILEIRA nó vivo {node:08x} (estado {st}) na fila {q:08x} (thread tls {:08x})\n{}",
+            c.tls,
+            trace_dump(160)
+        );
+    }
+}
+
+/// `YW_AUDIO_JITTER=N` (teste): em ~1 de cada N chamadas, a thread do jogo dorme 2–9 ms (como uma preempção longa do
+/// host no meio do tratador do status do DSP). Chamado pela sonda de `FUN_00141f40` (uma vez por fonte).
+pub fn jitter() {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static N: AtomicU32 = AtomicU32::new(u32::MAX);
+    static RNG: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut n = N.load(Relaxed);
+    if n == u32::MAX {
+        n = std::env::var("YW_AUDIO_JITTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        N.store(n, Relaxed);
+    }
+    if n == 0 {
+        return;
+    }
+    let mut x = RNG.load(Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    RNG.store(x, Relaxed);
+    if (x >> 8) % n as u64 == 0 {
+        std::thread::sleep(std::time::Duration::from_micros(2000 + (x >> 40) % 7000));
+    }
+}
+
+/// As últimas `max` entradas do anel, da mais antiga para a mais nova, como texto.
+pub fn trace_dump(max: usize) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let pos = TRACE_POS.load(Relaxed) as usize;
+    let count = pos.min(TRACE_N).min(max);
+    let mut s = String::new();
+    let t_last = if count > 0 { TRACE_BUF[((pos - 1) % TRACE_N) * TRACE_W].load(Relaxed) } else { 0 };
+    for k in (0..count).rev() {
+        let i = ((pos - 1 - k) % TRACE_N) * TRACE_W;
+        let g = |j: usize| TRACE_BUF[i + j].load(Relaxed);
+        let (us, tls, tag, a, b, d, e, f) = (g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7));
+        let rel = t_last.wrapping_sub(us);
+        let line = match tag {
+            1 => format!("enfileira nó {a:08x} (estado {} seq {}) fila: cabeça {d:08x} contagem {e} obj {f:08x}", b & 0xff, b >> 8),
+            2 => format!(
+                "status fonte {a:2}: ligada {} dirty {} sync {} atual {} último {} · fila: cabeça {d:08x} contagem {} sync esperado {}",
+                b & 0xff, (b >> 8) & 0xff, b >> 16, e & 0xffff, e >> 16, f & 0xffff, f >> 16
+            ),
+            3 => format!("PARA/limpa fila {a:08x}: cabeça {d:08x} contagem {e}"),
+            4 => format!("atualiza fila {a:08x}: flag6f {} estado da cabeça {} · cabeça {d:08x} contagem {e} +0x36 {f}", b & 0xff, (b >> 8) & 0xff),
+            _ => format!("tag {tag} {a:08x} {b:08x} {d:08x} {e:08x} {f:08x}"),
+        };
+        s.push_str(&format!("  -{:>8}µs tls {tls:08x} {line}
+", rel));
+    }
+    s
+}
+
 /// Ponto de checagem de preempção (custo: uma leitura atômica relaxada).
 #[inline(always)]
 pub fn poll(c: &mut Cpu) {
@@ -159,6 +336,28 @@ extern "Rust" {
     fn yw1_preempt(c: &mut Cpu);
     fn yw1_svc(c: &mut Cpu, imm: u32);
     fn yw1_dispatch(c: &mut Cpu, va: u32, ret: u32);
+    fn yw1_is_mapped(a: u32) -> bool;
+}
+
+// ---------------------------------------------------------------- ganchos (engine/src/hle/hooks.rs)
+
+/// Assinatura de toda função recompilada: `f_XXXXXXXX(c, pc de entrada, endereço de retorno)`.
+pub type GuestFn = unsafe fn(&mut Cpu, u32, u32);
+
+/// Bit somado ao pc de entrada para "chamar a original": o cabeçalho gerado de cada função pula o gancho de entrada
+/// só nessa chamada (as chamadas internas, inclusive recursivas, voltam a passar por ele). Todo código guest fica
+/// abaixo de 0x8000_0000 (o gerador afirma), então nenhum pc real tem esse bit.
+pub const HOOK_ORIG: u32 = 0x8000_0000;
+
+/// Tabelas geradas no crate `dispatch` (`yw1_hook_tables`), na ordem do índice de função do gerador:
+/// - `hooked[i]`: byte que o cabeçalho de cada função lê na entrada (≠ 0 = chamar `yw1_hook_entry` do motor);
+/// - `funcs[i]`: (chave da função = endereço | 1 se Thumb, função recompilada), ordenada pela chave;
+/// - `at`: endereços de instrução instrumentados por `recomp/hooks.toml` (ordenados) — só eles aceitam `registrar_em`.
+#[derive(Clone, Copy)]
+pub struct HookTables {
+    pub hooked: &'static [std::sync::atomic::AtomicU8],
+    pub funcs: &'static [(u32, GuestFn)],
+    pub at: &'static [u32],
 }
 
 /// `svc #imm`
@@ -603,6 +802,10 @@ mod tests {
     fn yw1_preempt(_c: &mut Cpu) {}
     #[no_mangle]
     fn yw1_dispatch(_c: &mut Cpu, _va: u32, _ret: u32) {}
+    #[no_mangle]
+    fn yw1_is_mapped(_a: u32) -> bool {
+        false
+    }
 
     #[test]
     fn add_sub_flags() {

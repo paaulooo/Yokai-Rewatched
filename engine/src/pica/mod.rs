@@ -4,17 +4,20 @@
 //! vértices, roda o shader de vértice (`shader.rs`), monta e recorta primitivas e rasteriza (`raster.rs`) direto no
 //! color/depth buffer da memória guest (blocos 8×8), que o DisplayTransfer do GSP já converte para a tela.
 //!
-//! Registradores: 3dbrew "GPU/Internal Registers" e `regs_*.h` do Citra/Azahar. Com `YW_RENDERER=vulkan` os
-//! triângulos sombreados vão para o backend de GPU (`crate::render`) em vez de `raster.rs`; o DX12 virá igual.
+//! Registradores: 3dbrew "GPU/Internal Registers" e `regs_*.h` do Citra/Azahar. Com `YW_RENDERER=vulkan` (padrão)
+//! o draw vai para o backend de GPU (`crate::render`) em vez de `raster.rs`: normalmente com o shader de vértice
+//! interpretado na própria GPU (`vs_gpu.rs` prepara os registradores; `render/shaders/pica_vs.vert`); com
+//! `YW_VK_CPU_VS=1` (ou sem suporte) o shader roda aqui na CPU e só os triângulos sombreados vão para a GPU.
 
 pub mod raster;
 pub mod shader;
 pub mod texture;
+mod vs_gpu;
 
 use crate::hle::mem::pa_to_va;
 use raster::{Ctx, Stage, Vtx};
 use shader::{f24, unpack_f24x4, Exec, Program, V4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use texture::Tex;
 use yw1_rt::{r16, r32, r8};
@@ -26,7 +29,7 @@ pub static DRAWS: AtomicU64 = AtomicU64::new(0);
 /// 0 lista inteira · 1 shader de vértice (CPU) · 2 vulkan::draw · 3 sincronismo GPU↔memória (execução do lote e
 /// devolução preguiçosa, nos ganchos do GSP; fora da lista)
 /// · 4 DisplayTransfer · 5 MemoryFill
-pub static PROF: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub static PROF: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Mede `f` e soma em `PROF[i]`.
 pub fn timed<R>(i: usize, f: impl FnOnce() -> R) -> R {
@@ -50,6 +53,15 @@ pub struct State {
     fixed_buf: [u32; 4],
     fixed_n: usize,
     pub fixed_attr: [V4; 16],
+    /// muda a cada escrita no código/descritores do shader de vértice (o backend de GPU só recalcula o hash do
+    /// programa quando ela muda); única no processo, inclusive entre `State`s diferentes
+    pub prog_gen: u64,
+}
+
+static PROG_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_prog_gen() -> u64 {
+    PROG_GEN.fetch_add(1, Ordering::Relaxed)
 }
 
 impl State {
@@ -62,6 +74,7 @@ impl State {
             fixed_buf: [0; 4],
             fixed_n: 0,
             fixed_attr: [[0.0, 0.0, 0.0, 1.0]; 16],
+            prog_gen: next_prog_gen(),
         }
     }
 }
@@ -180,6 +193,7 @@ fn write_reg(st: &mut State, reg: u32, val: u32, mask: u32) {
             let off = (st.regs[0x2cb] & 0xfff) as usize;
             if off < st.vs.code.len() {
                 st.vs.code[off] = v;
+                st.prog_gen = next_prog_gen();
             }
             st.regs[0x2cb] = (st.regs[0x2cb] & !0xfff) | ((off as u32 + 1) & 0xfff);
         }
@@ -187,6 +201,7 @@ fn write_reg(st: &mut State, reg: u32, val: u32, mask: u32) {
             let off = (st.regs[0x2d5] & 0x7f) as usize;
             if off < st.vs.desc.len() {
                 st.vs.desc[off] = v;
+                st.prog_gen = next_prog_gen();
             }
             st.regs[0x2d5] = (st.regs[0x2d5] & !0x7f) | ((off as u32 + 1) & 0x7f);
         }
@@ -390,10 +405,10 @@ fn context(r: &[u32]) -> Ctx {
             (r[0x68] & 0x3ff) as f32,
             ((r[0x68] >> 16) & 0x3ff) as f32,
         ],
-        zscale: f24(r[0x4d]),
-        zoffset: f24(r[0x4e]),
+        zscale: force_zmap().map_or(f24(r[0x4d]), |z| z.0),
+        zoffset: force_zmap().map_or(f24(r[0x4e]), |z| z.1),
         // Citra: DepthBuffering::WBuffering = 0 [H: confirmar na captura]
-        wbuffer: r[0x6d] & 1 == 0,
+        wbuffer: r[0x6d] & 1 == 0 || force_wbuf(),
         cull: r[0x40] & 3,
         scissor: (
             r[0x65] & 3,
@@ -430,6 +445,40 @@ fn context(r: &[u32]) -> Ctx {
     }
 }
 
+/// Já apareceu um draw com w-buffer (log uma vez).
+static WBUF_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Testes: força o w-buffer em todos os draws (o quadro capturado não o liga; `tests::pica_frame_wbuffer`).
+#[cfg(test)]
+pub(crate) static FORCE_WBUF: AtomicBool = AtomicBool::new(false);
+
+/// Testes: substitui (zscale, zoffset) — bits f32 de cada um em 32 bits; 0 = não substitui.
+#[cfg(test)]
+pub(crate) static FORCE_ZMAP: AtomicU64 = AtomicU64::new(0);
+
+fn force_zmap() -> Option<(f32, f32)> {
+    #[cfg(test)]
+    {
+        let v = FORCE_ZMAP.load(Ordering::Relaxed);
+        (v != 0).then(|| (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32)))
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+fn force_wbuf() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_WBUF.load(Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn draw(st: &mut State, indexed: bool) {
     let r = &st.regs;
     let n = r[0x228];
@@ -439,6 +488,14 @@ fn draw(st: &mut State, indexed: bool) {
     let ctx = context(r);
     if ctx.color_addr == 0 && ctx.depth_addr == 0 {
         return;
+    }
+    // w-buffer em uso (profundidade = z·zscale + w·zoffset com correção de perspectiva): avisa uma vez — o quadro de
+    // teste do quarto não liga (0x6D = 1), então só as rodadas mostram se alguma cena usa
+    if ctx.wbuffer && ctx.depth_addr != 0 && (ctx.depth_test || ctx.depth_write) && !WBUF_SEEN.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[pica] w-buffer ligado (0x6D = {:#x}, zscale {}, zoffset {}) — 1º draw com ele",
+            r[0x6d], ctx.zscale, ctx.zoffset
+        );
     }
     let base = r[0x200] << 3;
     let icfg = r[0x227];
@@ -490,6 +547,27 @@ fn draw(st: &mut State, indexed: bool) {
     if !vertex_memory_ok(st, lo, hi) {
         bad_draw("vértices fora da memória mapeada");
         return;
+    }
+    // shader de vértice na GPU: a CPU só traduz os registradores; se o draw não couber nesse caminho, segue abaixo
+    if crate::render::gpu_vs() {
+        let prep = timed(1, || vs_gpu::prepare(st, &ctx, &idx, lo, hi, topo));
+        if let Some(p) = prep {
+            let d = crate::render::VsDraw {
+                indices: &p.indices,
+                spans: &p.spans,
+                shading: &p.shading,
+                prog_gen: st.prog_gen,
+                code: &st.vs.code,
+                desc: &st.vs.desc,
+                data: None,
+            };
+            if timed(2, || crate::render::vulkan::draw_vs(&ctx, &d)) {
+                if debug {
+                    eprintln!("[pica] draw n={n} topo={topo} entry={:#x} (vértices na GPU)", st.vs.entry);
+                }
+                return;
+            }
+        }
     }
     let mut slot = vec![u32::MAX; (hi - lo) as usize + 1];
     let mut uniq: Vec<u32> = Vec::new();

@@ -1,0 +1,50 @@
+#version 450
+// Imagem final da tela a partir da "sombra" N× do alvo de render (resolução interna): faz, em N× de resolução, o que o
+// DisplayTransfer do jogo faz na resolução nativa (hle/gpu.rs::display_transfer_inner) — girar (o alvo do PICA é
+// guardado "deitado": coluna do LCD = linha do alvo), inverter se o jogo pediu, e reduzir sx×sy (o jogo usa 2×1 como
+// antisserrilhamento horizontal). A saída tem (linhas·N) × (colunas·N) pixels RGBA8, linha a linha, de cima para baixo.
+// Convenções (verificadas contra o DisplayTransfer no teste pica_frame_hires):
+//   - a imagem do alvo tem a linha 0 = linha de memória (altura − 1) (vulkan.rs: "linhas de baixo para cima");
+//   - pixel (X, Y) do LCD ↔ coluna de saída x = ow − 1 − Y, linha de saída y = flip ? hh − 1 − X : X;
+//   - dentro de cada pixel nativo há N×N amostras; X crescente = linha de memória crescente (invertido com flip) e Y
+//     crescente = coluna decrescente.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, std430) writeonly buffer Out { uint px[]; };
+layout(push_constant) uniform P {
+    uint n;    // fator da resolução interna
+    uint sx;   // redução horizontal do DisplayTransfer (1 ou 2)
+    uint sy;   // redução vertical (1 ou 2)
+    uint flip; // inverter na vertical (bit 0 dos flags)
+    uint ih;   // altura do alvo, em pixels nativos
+    uint ow;   // colunas da saída nativa (240)
+    uint hh;   // linhas da saída nativa (400)
+} p;
+
+void main() {
+    uint fw = p.hh * p.n;
+    uint fh = p.ow * p.n;
+    uint xp = gl_GlobalInvocationID.x;
+    uint yp = gl_GlobalInvocationID.y;
+    if (xp >= fw || yp >= fh) return;
+    uint X = xp / p.n, subX = xp % p.n;
+    uint Y = yp / p.n, subY = yp % p.n;
+    uint xout = p.ow - 1u - Y;
+    bool flip = p.flip != 0u;
+    uint yout = flip ? p.hh - 1u - X : X;
+    uint s = flip ? p.n - 1u - subX : subX;
+    uint ihn = p.ih * p.n;
+    vec4 sum = vec4(0.0);
+    for (uint ty = 0u; ty < p.sy; ty++) {
+        uint mrow = yout * p.sy * p.n + s * p.sy + ty;
+        int row = int(ihn - 1u - mrow);
+        for (uint tx = 0u; tx < p.sx; tx++) {
+            uint col = xout * p.sx * p.n + (p.n - 1u - subY) * p.sx + tx;
+            sum += texelFetch(src, ivec2(int(col), row), 0);
+        }
+    }
+    sum /= float(p.sx * p.sy);
+    // truncado como a média inteira do DisplayTransfer (acc / n)
+    uvec3 c = uvec3(clamp(floor(sum.rgb * 255.0 + 0.01), 0.0, 255.0));
+    px[yp * fw + xp] = c.r | (c.g << 8) | (c.b << 16) | (255u << 24);
+}

@@ -1,11 +1,22 @@
 //! Compila os shaders GLSL do backend Vulkan (`src/render/shaders/*.{vert,frag}`) para SPIR-V em `OUT_DIR`, com o
 //! `glslangValidator` (variável `YW_GLSLANG`, o do MSYS2 UCRT64 ou o do PATH). Sem ele, usa os `.spv` pré-gerados
 //! de `src/render/spv/` (gerados por este mesmo script; são nossos, não contêm nada do jogo).
+//! Uma fonte pode gerar mais de um módulo com `#define`s diferentes (ex.: `pica_frag_fastz.spv` = `pica.frag` com
+//! `-DFAST_Z`, sem escrita de `gl_FragDepth`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: [&str; 2] = ["pica.vert", "pica.frag"];
+/// (fonte em `src/render/shaders/`, módulo SPIR-V gerado em `OUT_DIR` e copiado para `src/render/spv/`, defines)
+const SHADERS: [(&str, &str, &[&str]); 6] = [
+    ("pica.vert", "pica_vert.spv", &[]),
+    ("pica_vs.vert", "pica_vs_vert.spv", &[]),
+    ("pica.frag", "pica_frag.spv", &[]),
+    // F4: fragmento sem gl_FragDepth (profundidade rápida na sombra N× e nos intermediários da interpolação)
+    ("pica.frag", "pica_frag_fastz.spv", &["FAST_Z"]),
+    ("present.comp", "present_comp.spv", &[]),
+    ("fxaa.comp", "fxaa_comp.spv", &[]),
+];
 
 fn glslang() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
@@ -25,17 +36,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=YW_GLSLANG");
     println!("cargo:rerun-if-env-changed=YW_UPDATE_SPV");
     let tool = glslang();
-    for name in SHADERS {
+    for (name, spv, defines) in SHADERS {
         let input = src.join(name);
         println!("cargo:rerun-if-changed={}", input.display());
-        let spv = format!("{}.spv", name.replace('.', "_"));
-        let dst = out.join(&spv);
+        let dst = out.join(spv);
         match &tool {
             Some(t) => {
-                let o = Command::new(t).arg("-V").arg(&input).arg("-o").arg(&dst).output().expect("glslangValidator");
+                let mut cmd = Command::new(t);
+                cmd.arg("-V");
+                for d in defines {
+                    cmd.arg(format!("-D{d}"));
+                }
+                let o = cmd.arg(&input).arg("-o").arg(&dst).output().expect("glslangValidator");
                 if !o.status.success() {
                     panic!(
-                        "falha ao compilar {name}:\n{}{}",
+                        "falha ao compilar {name} → {spv}:\n{}{}",
                         String::from_utf8_lossy(&o.stdout),
                         String::from_utf8_lossy(&o.stderr)
                     );
@@ -43,9 +58,9 @@ fn main() {
                 // Cópia pré-gerada (para quem compila sem o glslang): fica versionada em src/, então só é regravada
                 // quando o shader mudou depois dela (ou com YW_UPDATE_SPV=1) e o conteúdo é diferente. Uma versão
                 // diferente do glslang sozinha não suja a árvore do git.
-                update_prebuilt(&dst, &pre.join(&spv), &input);
+                update_prebuilt(&dst, &pre.join(spv), &input);
             }
-            None => copy_prebuilt(&pre.join(&spv), &dst),
+            None => copy_prebuilt(&pre.join(spv), &dst),
         }
     }
 }

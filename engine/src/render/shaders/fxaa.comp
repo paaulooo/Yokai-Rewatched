@@ -1,0 +1,91 @@
+#version 450
+// FXAA (algoritmo de Timothy Lottes, "FXAA 3.11", reescrito aqui) aplicado só à CENA 3D da sombra N× (vulkan.rs: entre
+// o último draw com profundidade e o primeiro draw de interface), nunca ao texto/HUD. Lê uma cópia da cena e escreve
+// na própria sombra.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { uint w; uint h; } p;
+
+const float EDGE_MIN = 0.0312;       // contraste mínimo absoluto
+const float EDGE_THRESHOLD = 0.125;  // contraste mínimo relativo ao máximo local
+const float SUBPIX = 0.75;           // força da suavização de subpixel
+const float STEPS[12] = float[12](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec3 at(ivec2 q) { return texelFetch(src, clamp(q, ivec2(0), ivec2(int(p.w) - 1, int(p.h) - 1)), 0).rgb; }
+vec3 samp(vec2 pos) { return textureLod(src, pos / vec2(float(p.w), float(p.h)), 0.0).rgb; }
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= int(p.w) || q.y >= int(p.h)) return;
+    vec4 mid = texelFetch(src, q, 0);
+    float lM = luma(mid.rgb);
+    float lN = luma(at(q + ivec2(0, -1)));
+    float lS = luma(at(q + ivec2(0, 1)));
+    float lW = luma(at(q + ivec2(-1, 0)));
+    float lE = luma(at(q + ivec2(1, 0)));
+    float mx = max(max(lN, lS), max(max(lW, lE), lM));
+    float mn = min(min(lN, lS), min(min(lW, lE), lM));
+    float range = mx - mn;
+    if (range < max(EDGE_MIN, mx * EDGE_THRESHOLD)) {
+        imageStore(dst, q, mid);
+        return;
+    }
+    float lNW = luma(at(q + ivec2(-1, -1)));
+    float lNE = luma(at(q + ivec2(1, -1)));
+    float lSW = luma(at(q + ivec2(-1, 1)));
+    float lSE = luma(at(q + ivec2(1, 1)));
+    // borda horizontal ou vertical?
+    float edgeH = abs(-2.0 * lW + (lNW + lSW)) + abs(-2.0 * lM + (lN + lS)) * 2.0 + abs(-2.0 * lE + (lNE + lSE));
+    float edgeV = abs(-2.0 * lN + (lNW + lNE)) + abs(-2.0 * lM + (lW + lE)) * 2.0 + abs(-2.0 * lS + (lSW + lSE));
+    bool horz = edgeH >= edgeV;
+    // lado da borda: o vizinho de maior gradiente
+    float l1 = horz ? lN : lW;
+    float l2 = horz ? lS : lE;
+    float g1 = l1 - lM;
+    float g2 = l2 - lM;
+    bool first = abs(g1) >= abs(g2);
+    float gradScaled = 0.25 * max(abs(g1), abs(g2));
+    float lAvg = 0.5 * ((first ? l1 : l2) + lM);
+    float sgn = first ? -1.0 : 1.0;
+    vec2 pc = vec2(q) + 0.5;
+    vec2 posB = pc + (horz ? vec2(0.0, 0.5 * sgn) : vec2(0.5 * sgn, 0.0));
+    vec2 off = horz ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    // procura o fim da borda nos dois sentidos
+    vec2 posN = posB - off;
+    vec2 posP = posB + off;
+    float eN = luma(samp(posN)) - lAvg;
+    float eP = luma(samp(posP)) - lAvg;
+    bool doneN = abs(eN) >= gradScaled;
+    bool doneP = abs(eP) >= gradScaled;
+    for (int i = 1; i < 12 && !(doneN && doneP); i++) {
+        if (!doneN) {
+            posN -= off * STEPS[i];
+            eN = luma(samp(posN)) - lAvg;
+            doneN = abs(eN) >= gradScaled;
+        }
+        if (!doneP) {
+            posP += off * STEPS[i];
+            eP = luma(samp(posP)) - lAvg;
+            doneP = abs(eP) >= gradScaled;
+        }
+    }
+    float dstN = horz ? pc.x - posN.x : pc.y - posN.y;
+    float dstP = horz ? posP.x - pc.x : posP.y - pc.y;
+    bool dirN = dstN < dstP;
+    float dmin = min(dstN, dstP);
+    float span = dstN + dstP;
+    bool mLess = (lM - lAvg) < 0.0;
+    bool good = ((dirN ? eN : eP) < 0.0) != mLess;
+    float pixOff = good ? (0.5 - dmin / span) : 0.0;
+    // suavização de subpixel
+    float sA = (lN + lS + lW + lE) * 2.0 + (lNW + lNE + lSW + lSE);
+    float sB = sA * (1.0 / 12.0) - lM;
+    float sC = clamp(abs(sB) / range, 0.0, 1.0);
+    float sE = sC * sC * (-2.0 * sC + 3.0);
+    float subH = sE * sE * SUBPIX;
+    float fo = max(pixOff, subH);
+    vec2 pos = pc + (horz ? vec2(0.0, fo * sgn) : vec2(fo * sgn, 0.0));
+    imageStore(dst, q, vec4(samp(pos), mid.a));
+}

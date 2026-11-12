@@ -3,7 +3,7 @@
 //! Opções que ainda não existem no port aparecem desabilitadas com "(em breve)".
 
 use super::input::{key_name, pad_name};
-use super::settings::{Botao, Controle, Filtro, Idioma, Layout, PadLayout, Renderizador, Settings, Teclado};
+use super::settings::{Apresentacao, Botao, Controle, Filtro, Idioma, Layout, LimiteFps, PadLayout, Renderizacao, Renderizador, Settings, Teclado};
 use egui::{Align2, RichText, Vec2};
 use winit::keyboard::KeyCode;
 
@@ -57,10 +57,16 @@ pub struct Info {
     pub pads: Vec<String>,
     /// adaptador gráfico da janela (wgpu)
     pub apresentacao: String,
+    /// modos de apresentação que a GPU aceita (nomes do `wgpu::PresentMode`)
+    pub modos_presente: Vec<String>,
+    /// modo e fila realmente em uso na superfície
+    pub modo_em_uso: String,
     /// `YW_RENDERER` definido: o ambiente decide o renderizador
     pub renderer_do_ambiente: bool,
     /// renderizador do PICA que está de fato rodando (`render::backend()`; pode ter caído de Vulkan para Soft)
     pub renderer_em_uso: Option<crate::render::Backend>,
+    /// interpolação em uso (Hz; 0 = desligada) e taxa do monitor da janela (0 = desconhecida)
+    pub interp: (u32, u32),
 }
 
 pub struct Menu {
@@ -120,20 +126,28 @@ impl Menu {
             Pagina::Principal => "Yo-kai Watch — pausado",
             Pagina::Config => "Configurações",
         };
-        let largura: f32 = match self.pagina {
-            Pagina::Principal => 260.0f32,
-            Pagina::Config => 560.0f32,
-        }
-        .min(area.width() - 24.0)
-        .max(120.0);
-        egui::Window::new(titulo)
-            .id(egui::Id::unique("yw_menu"))
+        // tamanho inicial 20 % maior que o fixo de antes (260 e 560 de largura); a borda redimensiona, e o egui guarda o
+        // tamanho escolhido enquanto o jogo estiver aberto (cada página o seu)
+        let max_w = (area.width() - 24.0).max(120.0);
+        let max_h = (area.height() - 48.0).max(80.0);
+        let (largura, altura) = match self.pagina {
+            Pagina::Principal => (312.0f32, 0.0f32),
+            Pagina::Config => (672.0f32, max_h),
+        };
+        let mut janela = egui::Window::new(titulo)
+            .id(egui::Id::unique(("yw_menu", titulo)))
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .min_width(largura)
-            .max_width(largura)
-            .max_height((area.height() - 48.0).max(80.0))
+            .default_width(largura.min(max_w))
+            .min_width(220.0f32.min(max_w))
+            .max_width(max_w)
+            .min_height(80.0f32.min(max_h))
+            .max_height(max_h);
+        if altura > 0.0 {
+            janela = janela.default_height(altura);
+        }
+        janela
             .show(ctx, |ui| match self.pagina {
                 Pagina::Principal => {
                     ui.vertical_centered_justified(|ui| {
@@ -325,9 +339,131 @@ fn graficos(ui: &mut egui::Ui, s: &mut Settings, info: &Info) {
         };
         ui.label(RichText::new(txt).small());
     }
-    ui.add_enabled_ui(false, |ui| {
-        egui::ComboBox::from_label("Resolução interna (em breve)").selected_text("1× (nativa)").show_ui(ui, |_| {});
+    combo(ui, "Renderização", &mut g.renderizacao, &Renderizacao::ALL, Renderizacao::nome);
+    ui.label(
+        RichText::new(
+            "Assíncrona: a GPU do PC desenha enquanto o jogo segue para o próximo quadro. Síncrona: cada lote é \
+             desenhado e esperado na hora (mais lenta; só para comparar ou contornar problemas). Só no renderizador \
+             Vulkan; vale ao reiniciar; YW_VK_ASYNC (ambiente) manda por cima.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(6.0);
+    ui.label(RichText::new("Apresentação da janela").strong());
+    combo(ui, "Modo", &mut g.apresentacao, &Apresentacao::ALL, Apresentacao::nome);
+    let aceita = |n: &str| info.modos_presente.iter().any(|m| m == n);
+    let falta = match g.apresentacao {
+        Apresentacao::Caixa if !aceita("Mailbox") => Some("esta GPU não oferece Mailbox: usando V-Sync"),
+        Apresentacao::SemSincronia if !aceita("Immediate") => Some("esta GPU não oferece modo imediato: usando o que o driver tiver sem V-Sync"),
+        _ => None,
+    };
+    if let Some(f) = falta {
+        ui.label(RichText::new(f).small().color(egui::Color32::from_rgb(220, 160, 60)));
+    }
+    ui.horizontal(|ui| {
+        ui.label("Quadros em voo:");
+        for n in 1..=3 {
+            ui.selectable_value(&mut g.quadros_em_voo, n, n.to_string());
+        }
     });
+    combo(ui, "Redesenhos por segundo (máx.)", &mut g.limite_fps, &LimiteFps::ALL, LimiteFps::nome);
+    ui.label(
+        RichText::new(
+            "O jogo anda sempre na velocidade do console (30 quadros/s de imagem nova); estes ajustes só decidem como \
+             e quando cada quadro novo chega ao monitor: Mailbox/Imediato e 1 quadro em voo dão a menor latência. \
+             Redesenhos são as repinturas da janela sem imagem nova (menu, mouse); desligados, a janela só repinta \
+             quando o jogo ou a interpolação trazem imagem nova, e a entrada continua lida a cada milissegundo. \
+             Valem na hora.",
+        )
+        .weak()
+        .small(),
+    );
+    if !info.modo_em_uso.is_empty() {
+        ui.label(RichText::new(format!("Em uso: {}", info.modo_em_uso)).small());
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Anisotrópico (texturas):");
+        for (n, nome) in [(0, "desligado"), (2, "2×"), (4, "4×"), (8, "8×"), (16, "16×")] {
+            ui.selectable_value(&mut g.anisotropico, n, nome);
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Extra do port (o PICA real não tem): em superfícies inclinadas ou distantes o jogo tira várias amostras \
+             da textura em vez de uma, menos serrilhado e cintilação. Só no renderizador Vulkan; custa GPU.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Resolução interna:");
+        for n in 1..=6u32 {
+            let nome = if n == 1 { "1× (nativa)".to_string() } else { format!("{n}×") };
+            ui.selectable_value(&mut g.escala_interna, n, nome);
+        }
+    });
+    ui.label(
+        RichText::new(
+            "A cena 3D das telas é desenhada em N× o tamanho do 3DS (a de cima: 400N×240N pixels); o jogo continua \
+             lendo a imagem nativa, então nada do jogo muda. Custa GPU (cerca de N² vezes o desenho das telas). Só no \
+             renderizador Vulkan.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.horizontal(|ui| {
+        ui.label("Interpolação de quadros:");
+        for (hz, nome) in [(0u32, "desligada"), (60, "60"), (90, "90"), (120, "120"), (144, "144"), (180, "180")] {
+            ui.selectable_value(&mut g.interpolacao, hz, nome);
+        }
+    });
+    ui.label(
+        RichText::new(
+            "O jogo roda a 30 quadros por segundo e conta tempo em quadros, então a velocidade não muda. Entre dois \
+             quadros reais o port refaz o desenho da cena com as posições (matrizes de câmera e de ossos, rotações \
+             por quatérnio) em ponto intermediário: nenhuma imagem é misturada. Cortes de cena, vídeo e geometria \
+             que muda de forma voltam ao quadro real. Os passos aparecem em ordem e igualmente espaçados, e nunca \
+             passam da taxa do monitor. Atrasa a imagem em até um quadro do jogo e custa GPU (≈2–3 ms por quadro \
+             intermediário). Só no renderizador Vulkan.",
+        )
+        .weak()
+        .small(),
+    );
+    if g.interpolacao > 0 {
+        let (em_uso, monitor) = info.interp;
+        let txt = match monitor {
+            0 => format!("Em uso: {em_uso} Hz"),
+            m if em_uso < g.interpolacao => format!("Em uso: {em_uso} Hz (limitada à taxa do monitor, {m} Hz)"),
+            m => format!("Em uso: {em_uso} Hz (monitor: {m} Hz)"),
+        };
+        ui.label(RichText::new(txt).small());
+    }
+    ui.checkbox(&mut g.fxaa, "FXAA só na cena 3D (não suaviza texto nem HUD)");
+    ui.checkbox(&mut g.fsr, "FSR 1 ao ampliar para a janela (EASU + nitidez)");
+    ui.add_enabled_ui(g.fsr, |ui| {
+        ui.add(egui::Slider::new(&mut g.fsr_nitidez, 0..=100).text("Nitidez do FSR").suffix(" %"));
+    });
+    ui.label(
+        RichText::new(
+            "FSR 1 só entra quando a janela é maior que a imagem da tela. O FSR 2/3 (temporal e geração de quadros) \
+             precisa de vetores de movimento e jitter do motor do jogo, e o FSR 4 só existe em GPUs RDNA 4: nenhum \
+             dos dois se aplica a este port.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.checkbox(&mut g.estereo_3d, "3D estéreo (desenha o olho direito; vale ao reiniciar)");
+    ui.label(
+        RichText::new(
+            "A janela mostra só o olho esquerdo. Desligado, o jogo roda no modo 2D do console e desenha a tela de \
+             cima uma vez por quadro em vez de duas. YW_STEREO (ambiente) manda por cima.",
+        )
+        .weak()
+        .small(),
+    );
     ui.add_space(6.0);
     combo(ui, "Layout das telas", &mut g.layout, &Layout::ALL, Layout::nome);
     ui.horizontal(|ui| {

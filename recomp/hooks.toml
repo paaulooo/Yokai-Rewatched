@@ -1,0 +1,23 @@
+# Ganchos em INSTRUÇÃO do código recompilado (lido por `yw1-recomp`, `recomp/src/main.rs`).
+#
+# Ganchos na ENTRADA de funções não precisam de nada aqui: toda função gerada já tem o teste de entrada e o motor os
+# liga em tempo de execução (`engine/src/hle/hooks.rs`, `registrar`). Este arquivo é só para pontos no MEIO de uma
+# função — por exemplo, ler os argumentos de uma chamada virtual (`blx rX`) ou o valor de um registrador numa
+# instrução específica. O gerador emite `yw1_hook_at(c, va)` ANTES da instrução; o motor chama os callbacks
+# registrados com `hooks::registrar_em(va, ...)` (que recusa um va que não esteja nesta lista).
+#
+# Regras:
+# - `va` = endereço da instrução (par; sem o bit Thumb). Tem de ser o início de uma instrução que o recompilador
+#   decodificou, senão a geração falha. Se a instrução pertencer a mais de uma função (código compartilhado), o
+#   gancho entra em todas.
+# - O gancho dispara mesmo quando a instrução é condicional e a condição for falsa (o teste é feito depois, pela
+#   própria instrução): o callback pode olhar as flags (`c.n`, `c.z`, `c.c`, `c.v`) se precisar saber.
+# - Cada entrada nova muda o código gerado: regerar (`cd recomp && cargo run --release`) e recompilar o app.
+#
+# Formato:
+#   [[at]]
+#   va = 0x114600
+#   nome = "nome_curto"
+#   motivo = "por que este ponto precisa de gancho (o que o callback lê/muda)"
+#
+# (vazio por enquanto: os ganchos reais vêm nas próximas fases — etiquetas de draw, mods, widescreen)

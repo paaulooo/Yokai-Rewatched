@@ -42,6 +42,10 @@ def main():
         YW_FRAMES_DIR=str(out),
         YW_RENDERER=a.renderer,
     )
+    logdir = WORK / "logs" / a.name
+    for f in logdir.glob("*"):
+        f.unlink()
+    env["YW_LOG_DIR"] = str(logdir)  # pasta de logs da execução (game.log, perf.log, gfx.log, stall.log…)
     if a.input:
         env["YW_INPUT"] = a.input
     log = WORK / "runs" / f"{a.name}.log"

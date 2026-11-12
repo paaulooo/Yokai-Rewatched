@@ -14,6 +14,10 @@ use yw1_rt::{r16, r32, r8, w16, w32, w8};
 
 /// Contadores de diagnóstico (por draw, zerados pelo chamador): triângulos, recortados fora, descartados por
 /// orientação, fragmentos, reprovados no alpha / stencil / depth, escritos.
+/// Testes: w-buffer com a fórmula anterior à correção de 09/11 (`tests::pica_frame_wbuffer`).
+#[cfg(test)]
+pub(crate) static WBUF_OLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 fn stat(i: usize) {
     STATS[i].fetch_add(1, Relaxed);
@@ -65,6 +69,7 @@ pub struct Stage {
 }
 
 /// Estado por draw (lido dos registradores uma vez).
+#[derive(Clone)]
 pub struct Ctx {
     pub color_addr: u32,
     pub depth_addr: u32,
@@ -156,11 +161,11 @@ fn to_screen(c: &Ctx, v: &Vtx) -> Screen {
     let inv_w = 1.0 / v.pos[3];
     let sx = (v.pos[0] * inv_w + 1.0) * c.vp[0] + c.vp[2];
     let sy = (v.pos[1] * inv_w + 1.0) * c.vp[1] + c.vp[3];
-    let z = if c.wbuffer { v.pos[2] } else { v.pos[2] * inv_w };
     Screen {
         x: (sx * 16.0).round() as i32,
         y: (sy * 16.0).round() as i32,
-        z: c.zoffset + z * c.zscale,
+        // valor do z-buffer; com w-buffer `fragment` multiplica pelo w interpolado com correção de perspectiva
+        z: c.zoffset + v.pos[2] * inv_w * c.zscale,
         inv_w,
         v: *v,
     }
@@ -261,8 +266,20 @@ fn fragment(c: &Ctx, x: u32, y: u32, v0: &Screen, v1: &Screen, v2: &Screen, bc: 
     let persp = |f: &dyn Fn(&Vtx) -> f32| -> f32 {
         (f(&v0.v) * v0.inv_w * bc[0] + f(&v1.v) * v1.inv_w * bc[1] + f(&v2.v) * v2.inv_w * bc[2]) / wi
     };
-    // profundidade
-    let z = (v0.z * bc[0] + v1.z * bc[1] + v2.z * bc[2]).clamp(0.0, 1.0);
+    // profundidade: z/w·zscale + zoffset interpolado na tela; w-buffer (0x6D bit 0 = 0) multiplica pelo w com correção
+    // de perspectiva (1/Σ(bc/w)) → z·zscale + w·zoffset interpolados como as cores. Citra rasterizer.cpp: "z·scale +
+    // w·offset = (z/w·scale + offset)·w"; Zakuro raster.rs faz o mesmo (`depth *= w`).
+    let zl = v0.z * bc[0] + v1.z * bc[1] + v2.z * bc[2];
+    let z = if c.wbuffer { zl / wi } else { zl };
+    // testes: a fórmula antiga do w-buffer (zoffset + z·zscale interpolado na tela), para medir o que mudou
+    #[cfg(test)]
+    let z = if c.wbuffer && WBUF_OLD.load(Relaxed) {
+        let zo = |v: &Screen| c.zoffset + v.v.pos[2] * c.zscale;
+        zo(v0) * bc[0] + zo(v1) * bc[1] + zo(v2) * bc[2]
+    } else {
+        z
+    };
+    let z = z.clamp(0.0, 1.0);
     let fy = c.height_m1 - y;
     let dbpp = match c.depth_fmt {
         0 => 2,

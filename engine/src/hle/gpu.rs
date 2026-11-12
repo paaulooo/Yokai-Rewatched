@@ -49,6 +49,87 @@ pub fn set_framebuffer(screen: u32, info: FbInfo) {
     if let Some(f) = GPU.lock().unwrap().fb.get_mut(screen as usize) {
         *f = info;
     }
+    if screen == 0 {
+        note_top(&info);
+    }
+    note_shown(&info);
+}
+
+/// Framebuffers (endereço virtual) que as DUAS telas mostraram (os 8 últimos distintos). Um DisplayTransfer para outro
+/// endereço é uma cópia que o jogo usa para outra coisa (neste jogo, a cena vai a cada quadro também para 0x1F000000) e
+/// nenhuma tela mostra: não precisa de imagem em alta resolução (era FXAA + montagem + leitura de 3,5 MB por quadro a 3×).
+static SHOWN: Mutex<[u32; 8]> = Mutex::new([0; 8]);
+
+fn note_shown(f: &FbInfo) {
+    let a = super::mem::pa_to_va(f.left).unwrap_or(f.left);
+    let mut v = SHOWN.lock().unwrap();
+    if a != 0 && !v.contains(&a) {
+        v.rotate_right(1);
+        v[0] = a;
+    }
+}
+
+/// `addr` não é framebuffer de nenhuma tela? (só depois que as telas mostraram algo; antes disso tudo vale)
+pub fn not_shown(addr: u32) -> bool {
+    let v = SHOWN.lock().unwrap();
+    v[0] != 0 && !v.contains(&addr)
+}
+
+/// Framebuffers (endereço virtual) que o LCD de cima mostrou como olho esquerdo e como olho direito — os 4 últimos
+/// distintos de cada (o jogo alterna dois por olho). A janela só mostra o esquerdo: é o único que precisa de imagem em
+/// alta resolução e de interpolação. Medido: neste jogo o esquerdo é 0x1F300000/0x1F346500 e o direito
+/// 0x1F000000/0x1F046500 (o endereço sozinho não diz qual é qual — por isso vem do que o LCD mostra).
+static TOP_EYES: Mutex<([u32; 4], [u32; 4])> = Mutex::new(([0; 4], [0; 4]));
+
+fn note_top(f: &FbInfo) {
+    let va = |a: u32| super::mem::pa_to_va(a).unwrap_or(a);
+    let (l, r) = (va(f.left), va(f.right));
+    let push = |v: &mut [u32; 4], a: u32| {
+        if a != 0 && !v.contains(&a) {
+            v.rotate_right(1);
+            v[0] = a;
+        }
+    };
+    let mut e = TOP_EYES.lock().unwrap();
+    push(&mut e.0, l);
+    // modo mono (o jogo não ligou o 3D): não há olho escondido. O jogo pode mandar o mesmo buffer nos dois olhos (ou
+    // um "direito" que nunca recebe cena); registrar como direito arriscaria `top_hidden` verdadeiro para um buffer
+    // que a janela mostra (sem sombra N× nem interpolação nele)
+    if r != l && game_stereo() {
+        push(&mut e.1, r);
+    }
+}
+
+/// O jogo ligou o 3D estéreo? `DAT_00608b47` (code.bin.c, `FUN_00114588`): vira 1 logo depois de
+/// `nngxSetDisplayMode(0x702)` no boot e é o que o próprio jogo consulta (`FUN_00119a3c`, controle do 3D). Com
+/// `graficos.estereo_3d` desligado a sonda do recomp impede a chamada e ele fica 0.
+/// Troca da tela de cima sintetizada no modo mono (ver `display_transfer_native`).
+static SYNTH_TOP: Mutex<Option<FbInfo>> = Mutex::new(None);
+
+/// A próxima troca sintética da tela de cima, se houver (VBlank da tela de cima, `gsp::update_framebuffer`).
+pub fn take_synth_top() -> Option<FbInfo> {
+    SYNTH_TOP.lock().unwrap().take()
+}
+
+/// Troca sintética adiada (o buffer ainda tem DisplayTransfer na fila): volta, a não ser que já haja uma mais nova.
+pub fn put_back_synth_top(i: FbInfo) {
+    SYNTH_TOP.lock().unwrap().get_or_insert(i);
+}
+
+pub fn game_stereo() -> bool {
+    const STEREO_FLAG: u32 = 0x0060_8b47;
+    super::mem::is_mapped(STEREO_FLAG) && r8(STEREO_FLAG) != 0
+}
+
+/// `addr` é um framebuffer que o LCD de cima mostra como olho esquerdo (o da janela)?
+pub fn top_shown(addr: u32) -> bool {
+    addr != 0 && TOP_EYES.lock().unwrap().0.contains(&addr)
+}
+
+/// `addr` é só o olho direito do 3D estéreo (o LCD o usa como direito e nunca como esquerdo)? A janela não o mostra.
+pub fn top_hidden(addr: u32) -> bool {
+    let e = TOP_EYES.lock().unwrap();
+    addr != 0 && e.1.contains(&addr) && !e.0.contains(&addr)
 }
 
 /// Escritas diretas em registradores do LCD/GPU (endereços relativos a 0x1EB00000): framebuffers via registrador.
@@ -66,6 +147,12 @@ pub fn hw_regs_written(reg: u32, size: u32, ptr: u32) {
                 0x28 => f.stride = v,
                 _ => {}
             }
+            let info = *f;
+            drop(g);
+            if screen == 0 {
+                note_top(&info);
+            }
+            note_shown(&info);
         }
     }
 }
@@ -207,10 +294,83 @@ pub fn pica_color_fmt_to_gsp(fmt: u32) -> u32 {
 /// flags: bit0 inverter vertical, bit1 entrada linear (→ saída em blocos), bit3 cópia crua, bit5 sem swizzle,
 /// bits 8–10 formato de entrada, 12–14 formato de saída, 24–25 redução (0 nenhuma, 1 2×1, 2 2×2).
 pub fn display_transfer(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
+    if let Some(c) = display_transfer_native(inp, out, in_dims, out_dims, flags) {
+        crate::render::present_hires_finish(c);
+    }
+}
+
+/// A parte "nativa" do DisplayTransfer (o que o jogo pode ver: leitura do alvo, a transferência na memória dele, e o
+/// passo da imagem N× que precisa do alvo/texturas ainda intactos: `present_hires_check`). Devolve o resto da imagem
+/// N× (`render::present_hires_finish`: montagem, intermediários da interpolação, publicação), que a thread "gpu" roda
+/// DEPOIS de sinalizar o PPF ao jogo (PPF adiantado, `gsp.rs`).
+pub fn display_transfer_native(
+    inp: u32,
+    out: u32,
+    in_dims: u32,
+    out_dims: u32,
+    flags: u32,
+) -> Option<crate::render::vulkan::PresentChecked> {
     let (iw, ih, ow, oh) = (in_dims & 0xffff, in_dims >> 16, out_dims & 0xffff, out_dims >> 16);
-    crate::render::before_read(inp, inp.wrapping_add(iw * ih * bpp((flags >> 8) & 7)));
-    crate::render::before_write(out, out.wrapping_add(ow * oh * bpp((flags >> 12) & 7)));
-    crate::pica::timed(4, || display_transfer_inner(inp, out, in_dims, out_dims, flags))
+    // modo mono (3D desligado): o jogo transfere cada quadro da tela de cima para um de dois buffers, mas nunca publica a
+    // troca (o bloco de atualização da tela de cima na memória compartilhada fica zerado — o caminho mono do SDK não roda
+    // em console de varejo). A troca que o jogo faria é sintetizada: este buffer vai para a tela no próximo VBlank
+    // (`take_synth_top`, com o mesmo adiamento e contagem das trocas normais).
+    // (a saída é medida depois da redução: no quarto o alvo é 480×400 e a transferência reduz 2:1)
+    let (rx, ry) = match (flags >> 24) & 3 {
+        1 => (2, 1),
+        2 => (2, 2),
+        _ => (1, 1),
+    };
+    if !game_stereo() && ow / rx == 240 && oh / ry == 400 {
+        let fmt = (flags >> 12) & 7;
+        *SYNTH_TOP.lock().unwrap() = Some(FbInfo { active: 0, left: out, right: out, stride: 240 * bpp(fmt), format: fmt });
+    }
+    // saída que a janela não mostra (olho direito do 3D): a cena que acabou de ser desenhada no alvo não precisa da
+    // sombra N× (o nativo, que vai para a memória do jogo, continua igual)
+    let hidden = top_hidden(out) || not_shown(out);
+    crate::render::before_read_lcd(inp, inp.wrapping_add(iw * ih * bpp((flags >> 8) & 7)), hidden);
+    // área que a transferência REALMENTE escreve (ver `display_transfer_inner`: com redução a saída é ow/sx × oh/sy, e
+    // só w×h pixels são gravados). Anunciar mais que isso como "escrita" faz o renderizador descartar, sem devolver,
+    // superfícies pendentes vizinhas que a transferência nunca tocou.
+    let (sx, sy) = match (flags >> 24) & 3 {
+        1 => (2, 1),
+        2 => (2, 2),
+        _ => (1, 1),
+    };
+    let (ow2, oh2) = (ow / sx, oh / sy);
+    let full = iw / sx >= ow2 && ih / sy >= oh2;
+    let tiled_out = flags & 2 != 0 && flags & 0x20 == 0;
+    let rows = if tiled_out { oh2.next_multiple_of(8) } else { oh2 };
+    let hi = out.wrapping_add(ow2 * rows * bpp((flags >> 12) & 7));
+    if full {
+        crate::render::before_write(out, hi);
+    } else {
+        crate::render::before_read(out, hi);
+    }
+    crate::pica::timed(4, || display_transfer_inner(inp, out, in_dims, out_dims, flags));
+    // resolução interna: a mesma transferência, em N×, a partir da sombra do alvo (só o caso do LCD: entrada em blocos,
+    // saída linear, a saída inteira escrita)
+    if crate::render::hires_on() && !full_skip(flags) && full {
+        let bo = bpp((flags >> 12) & 7);
+        return crate::render::present_hires_check(crate::render::vulkan::PresentReq {
+            inp,
+            iw,
+            ih,
+            sx,
+            sy,
+            flip: flags & 1 != 0,
+            ow: ow2,
+            hh: oh2,
+            out,
+            out_bytes: ow2 * oh2 * bo,
+        });
+    }
+    None
+}
+
+/// Transferências que a imagem em alta resolução não reproduz (entrada linear ou sem swizzle).
+fn full_skip(flags: u32) -> bool {
+    flags & 2 != 0 || flags & 0x20 != 0
 }
 
 fn display_transfer_inner(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
@@ -234,53 +394,195 @@ fn display_transfer_inner(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags
             );
         }
     }
-    let (iw, ih) = (in_dims & 0xffff, in_dims >> 16);
-    let (ow, oh) = (out_dims & 0xffff, out_dims >> 16);
-    let flip = flags & 1 != 0;
-    let in_linear = flags & 2 != 0;
-    let no_swizzle = flags & 0x20 != 0;
-    let fin = (flags >> 8) & 7;
-    let fout = (flags >> 12) & 7;
-    let scale = (flags >> 24) & 3;
-    let (sx, sy) = match scale {
-        1 => (2, 1),
-        2 => (2, 2),
-        _ => (1, 1),
-    };
-    let (bi, bo) = (bpp(fin), bpp(fout));
-    // Citra `GPU::DisplayTransfer`: com redução, a largura/altura de saída do registrador é dividida pela escala e
-    // ESSA é a largura de linha da saída (antes usávamos a do registrador: listras nas cenas 3D com 2×1, 480→240)
-    let (ow, oh) = (ow / sx, oh / sy);
-    let w = ow.min(iw / sx);
-    let h = oh.min(ih / sy);
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = [0u32; 4];
-            for dy in 0..sy {
-                for dx in 0..sx {
-                    let (ix, iy) = (x * sx + dx, y * sy + dy);
-                    let src = if in_linear || no_swizzle {
-                        (iy * iw + ix) * bi
-                    } else {
-                        tiled_offset(ix, iy, iw, bi)
-                    };
-                    let p = read_pixel(inp + src, fin);
-                    for k in 0..4 {
-                        acc[k] += p[k] as u32;
-                    }
-                }
-            }
-            let n = sx * sy;
-            let p = acc.map(|v| (v / n) as u8);
-            let oy = if flip { h - 1 - y } else { y };
-            let dst = if in_linear && !no_swizzle {
-                tiled_offset(x, oy, ow, bo)
-            } else {
-                (oy * ow + x) * bo
-            };
-            write_pixel(out + dst, fout, p);
+    transfer_buffered(inp, out, in_dims, out_dims, flags);
+}
+
+/// Geometria de um DisplayTransfer: (iw, ih, ow, w, h, sx, sy, formato de entrada, de saída, flip, entrada linear,
+/// sem swizzle). `ow` já dividido pela redução (Citra `GPU::DisplayTransfer`: com redução, a largura/altura de saída do
+/// registrador é dividida pela escala e ESSA é a largura de linha da saída — antes usávamos a do registrador: listras
+/// nas cenas 3D com 2×1, 480→240).
+struct Xfer {
+    iw: u32,
+    ow: u32,
+    w: u32,
+    h: u32,
+    sx: u32,
+    sy: u32,
+    fin: u32,
+    fout: u32,
+    flip: bool,
+    in_linear: bool,
+    no_swizzle: bool,
+}
+
+impl Xfer {
+    fn new(in_dims: u32, out_dims: u32, flags: u32) -> Xfer {
+        let (iw, ih) = (in_dims & 0xffff, in_dims >> 16);
+        let (ow, oh) = (out_dims & 0xffff, out_dims >> 16);
+        let (sx, sy) = match (flags >> 24) & 3 {
+            1 => (2, 1),
+            2 => (2, 2),
+            _ => (1, 1),
+        };
+        let (ow, oh) = (ow / sx, oh / sy);
+        Xfer {
+            iw,
+            ow,
+            w: ow.min(iw / sx),
+            h: oh.min(ih / sy),
+            sx,
+            sy,
+            fin: (flags >> 8) & 7,
+            fout: (flags >> 12) & 7,
+            flip: flags & 1 != 0,
+            in_linear: flags & 2 != 0,
+            no_swizzle: flags & 0x20 != 0,
         }
     }
+    /// deslocamento (bytes) do pixel (ix, iy) na entrada
+    fn src(&self, ix: u32, iy: u32) -> u32 {
+        let bi = bpp(self.fin);
+        if self.in_linear || self.no_swizzle {
+            (iy * self.iw + ix) * bi
+        } else {
+            tiled_offset(ix, iy, self.iw, bi)
+        }
+    }
+    /// deslocamento (bytes) do pixel (x, oy) na saída
+    fn dst(&self, x: u32, oy: u32) -> u32 {
+        let bo = bpp(self.fout);
+        if self.in_linear && !self.no_swizzle {
+            tiled_offset(x, oy, self.ow, bo)
+        } else {
+            (oy * self.ow + x) * bo
+        }
+    }
+    /// pixel (x, y) da saída: média dos sx × sy pixels da entrada
+    fn pixel(&self, x: u32, y: u32, get: impl Fn(u32) -> [u8; 4]) -> [u8; 4] {
+        let mut acc = [0u32; 4];
+        for dy in 0..self.sy {
+            for dx in 0..self.sx {
+                let p = get(self.src(x * self.sx + dx, y * self.sy + dy));
+                for k in 0..4 {
+                    acc[k] += p[k] as u32;
+                }
+            }
+        }
+        let n = self.sx * self.sy;
+        acc.map(|v| (v / n) as u8)
+    }
+    /// tamanho (bytes) da faixa que a entrada / a saída ocupam: o maior deslocamento usado + 1 pixel (em blocos 8×8, o
+    /// maior está no último bloco: deslocamento do bloco + 63 pixels)
+    fn spans(&self) -> (u32, u32) {
+        let (bi, bo) = (bpp(self.fin), bpp(self.fout));
+        let (iw_used, ih_used) = (self.w * self.sx, self.h * self.sy);
+        let in_len = if self.in_linear || self.no_swizzle {
+            ((ih_used - 1) * self.iw + iw_used) * bi
+        } else {
+            (((ih_used - 1) / 8) * (self.iw / 8) + (iw_used - 1) / 8 + 1) * 64 * bi
+        };
+        let out_len = if self.in_linear && !self.no_swizzle {
+            (((self.h - 1) / 8) * (self.ow / 8) + (self.w - 1) / 8 + 1) * 64 * bo
+        } else {
+            ((self.h - 1) * self.ow + self.w) * bo
+        };
+        (in_len, out_len)
+    }
+}
+
+/// Pixel RGBA8 de um buffer local no formato do GSP (mesma conversão de `read_pixel`, memória little-endian).
+fn px_get(b: &[u8], o: usize, format: u32) -> [u8; 4] {
+    let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u32;
+    match format & 7 {
+        0 => {
+            let v = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            [(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8]
+        }
+        1 => [b[o + 2], b[o + 1], b[o], 255],
+        2 => {
+            let v = u16_at(o);
+            let (r, g, bl) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
+            [(r << 3 | r >> 2) as u8, (g << 2 | g >> 4) as u8, (bl << 3 | bl >> 2) as u8, 255]
+        }
+        3 => {
+            let v = u16_at(o);
+            let c = |s: u32| {
+                let x = (v >> s) & 31;
+                (x << 3 | x >> 2) as u8
+            };
+            [c(11), c(6), c(1), if v & 1 != 0 { 255 } else { 0 }]
+        }
+        _ => {
+            let v = u16_at(o);
+            let c = |s: u32| (((v >> s) & 15) * 17) as u8;
+            [c(12), c(8), c(4), c(0)]
+        }
+    }
+}
+
+/// Grava um pixel RGBA8 num buffer local no formato do GSP (mesma conversão de `write_pixel`).
+fn px_put(b: &mut [u8], o: usize, format: u32, p: [u8; 4]) {
+    let [r, g, bl, al] = p.map(|x| x as u32);
+    let put16 = |b: &mut [u8], v: u32| b[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
+    match format & 7 {
+        0 => b[o..o + 4].copy_from_slice(&(r << 24 | g << 16 | bl << 8 | al).to_le_bytes()),
+        1 => {
+            b[o] = bl as u8;
+            b[o + 1] = g as u8;
+            b[o + 2] = r as u8;
+        }
+        2 => put16(b, (r >> 3) << 11 | (g >> 2) << 5 | (bl >> 3)),
+        3 => put16(b, (r >> 3) << 11 | (g >> 3) << 6 | (bl >> 3) << 1 | (al >> 7)),
+        _ => put16(b, (r >> 4) << 12 | (g >> 4) << 8 | (bl >> 4) << 4 | (al >> 4)),
+    }
+}
+
+/// A transferência com uma cópia em bloco de cada lado (entrada inteira para um buffer local, a faixa de saída lida,
+/// convertida e escrita de volta) em vez de um acesso à memória guest por byte de cada pixel: o resultado é o mesmo
+/// byte a byte (teste `display_transfer_igual_ao_pixel_a_pixel`), e a thread da GPU deixa de gastar ~3 ms por quadro
+/// aqui (medido como "transfer 10 %" no perf.log). Faixa fora da memória mapeada: pixel a pixel, como antes.
+fn transfer_buffered(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
+    let x = Xfer::new(in_dims, out_dims, flags);
+    if x.w == 0 || x.h == 0 {
+        return;
+    }
+    let (in_len, out_len) = x.spans();
+    let mapped = |a: u32, n: u32| super::mem::is_mapped(a) && super::mem::is_mapped(a.wrapping_add(n - 1));
+    if !mapped(inp, in_len) || !mapped(out, out_len) {
+        transfer_per_pixel(inp, out, in_dims, out_dims, flags);
+        return;
+    }
+    let mut ib = vec![0u8; in_len as usize];
+    yw1_rt::read_bytes(inp, &mut ib);
+    let mut ob = vec![0u8; out_len as usize];
+    yw1_rt::read_bytes(out, &mut ob);
+    for y in 0..x.h {
+        let oy = if x.flip { x.h - 1 - y } else { y };
+        for xx in 0..x.w {
+            let p = x.pixel(xx, y, |o| px_get(&ib, o as usize, x.fin));
+            px_put(&mut ob, x.dst(xx, oy) as usize, x.fout, p);
+        }
+    }
+    yw1_rt::write_bytes(out, &ob);
+}
+
+/// A transferência pixel a pixel direto na memória guest (o caminho antigo; referência do teste e reserva quando a
+/// faixa não está toda mapeada).
+pub(crate) fn transfer_per_pixel(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
+    let x = Xfer::new(in_dims, out_dims, flags);
+    for y in 0..x.h {
+        let oy = if x.flip { x.h - 1 - y } else { y };
+        for xx in 0..x.w {
+            let p = x.pixel(xx, y, |o| read_pixel(inp + o, x.fin));
+            write_pixel(out + x.dst(xx, oy), x.fout, p);
+        }
+    }
+}
+
+/// A transferência rápida (para o teste de equivalência).
+#[cfg(test)]
+pub(crate) fn transfer_fast_for_test(inp: u32, out: u32, in_dims: u32, out_dims: u32, flags: u32) {
+    transfer_buffered(inp, out, in_dims, out_dims, flags);
 }
 
 /// TextureCopy(entrada, saída, tamanho total, largura/espaço de entrada, de saída, flags) — unidades de 16 bytes.
@@ -295,9 +597,16 @@ pub fn texture_copy(inp: u32, out: u32, total: u32, in_wg: u32, out_wg: u32, _fl
         return;
     }
     // faixas tocadas (linhas de `iw`/`ow` bytes separadas por `ig`/`og`)
-    let span = |w: u32, g: u32| total.div_ceil(w) * (w + g);
+    // (a última linha vai só até onde a cópia escreve, sem o intervalo nem o resto da linha)
+    let span = |w: u32, g: u32| (total / w) * (w + g) + total % w;
     crate::render::before_read(inp, inp.wrapping_add(span(iw, ig)));
-    crate::render::before_write(out, out.wrapping_add(span(ow, og)));
+    if og == 0 {
+        crate::render::before_write(out, out.wrapping_add(span(ow, og)));
+    } else {
+        // com intervalos, a faixa de saída tem bytes que a cópia NÃO escreve: uma superfície pendente dentro dela não
+        // pode ser descartada como "sobrescrita por inteiro" — volta à memória (devolução normal) antes da cópia.
+        crate::render::before_read(out, out.wrapping_add(span(ow, og)));
+    }
     let mut done = 0;
     let (mut ia, mut oa) = (inp, out);
     let (mut il, mut ol) = (0, 0);
@@ -321,6 +630,59 @@ pub fn texture_copy(inp: u32, out: u32, total: u32, in_wg: u32, out_wg: u32, _fl
         }
     }
 }
+
+/// Imagem em alta resolução de uma tela: o quadro real e, se ele foi interpolado, o grupo (intermediários + real) que a
+/// janela mostra em ordem, na cadência dela (`window.rs`, `Cadencia`).
+pub struct ScreenHi {
+    pub real: std::sync::Arc<crate::render::vulkan::HiRes>,
+    pub group: Option<std::sync::Arc<crate::render::vulkan::Group>>,
+    /// framebuffer (endereço virtual) de onde veio
+    pub addr: u32,
+}
+
+/// Imagem em alta resolução da tela `screen` (resolução interna / FXAA / interpolação), se o backend a montou para o
+/// framebuffer que o jogo mostra agora e esse framebuffer nativo ainda é o que a transferência escreveu (senão o jogo pôs
+/// outra coisa ali).
+pub fn screen_hires(screen: usize) -> Option<ScreenHi> {
+    if !crate::render::hires_on() {
+        return None;
+    }
+    let f = GPU.lock().unwrap().fb[screen];
+    let addr = super::mem::pa_to_va(f.left).unwrap_or(f.left);
+    let group = crate::render::vulkan::published_group(addr);
+    let real = match &group {
+        Some(g) => g.real.clone(),
+        None => crate::render::vulkan::published(addr)?,
+    };
+    if addr == 0 || !super::mem::is_mapped(addr) || !super::mem::is_mapped(addr + real.bytes.saturating_sub(1)) {
+        return None;
+    }
+    // a conferência do framebuffer nativo (hash de ~288 KB) só é refeita quando algo mudou — outro endereço, outra
+    // troca de framebuffer, outra imagem publicada — ou a cada 100 ms (o jogo pode escrever no buffer mostrado sem
+    // trocar). A janela chama isto a cada redesenho (até centenas por segundo)
+    use std::sync::atomic::Ordering::Relaxed;
+    let swaps = super::services::gsp::SWAPS[screen & 1].load(Relaxed);
+    let key = (addr, swaps, std::sync::Arc::as_ptr(&real) as usize, real.hash);
+    let now = std::time::Instant::now();
+    let mut cache = SCREEN_HI_CHECK.lock().unwrap();
+    let ok = match cache[screen & 1] {
+        Some((k, t, ok)) if k == key && now.duration_since(t) < std::time::Duration::from_millis(100) => ok,
+        _ => {
+            // SAFETY: a faixa inteira está mapeada (conferido acima) e a reserva vive até o fim do processo; o jogo
+            // ou a thread "gpu" podem estar escrevendo nela ao mesmo tempo, como em qualquer leitura da memória guest
+            let mem = unsafe { std::slice::from_raw_parts(yw1_rt::host_ptr(addr), real.bytes as usize) };
+            let ok = crate::render::hash_bytes(mem) == real.hash;
+            cache[screen & 1] = Some((key, now, ok));
+            ok
+        }
+    };
+    drop(cache);
+    ok.then_some(ScreenHi { real, group, addr })
+}
+
+/// Última conferência de `screen_hires` por tela: ((endereço, trocas, imagem publicada, hash), quando, resultado).
+#[allow(clippy::type_complexity)]
+static SCREEN_HI_CHECK: Mutex<[Option<((u32, u64, usize, u64), std::time::Instant, bool)>; 2]> = Mutex::new([None; 2]);
 
 /// Imagem RGBA (linhas de cima para baixo) da tela `screen` (0 = cima 400×240, 1 = baixo 320×240), lida do
 /// framebuffer linear que o jogo mostra (guardado "deitado": coluna a coluna, de baixo para cima).

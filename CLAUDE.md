@@ -39,10 +39,17 @@ cd work/recomp && cargo build --release -p yw1-recomp-app # executável yw1r (c�
 YW_HEADLESS_SECS=60 work/recomp/target/release/yw1r.exe   # sem janela; telas em work/recomp_frames/
 cd tools && python recomp_run.py NOME --secs 140 --input "24:a; +6:a"   # rodada com roteiro (YW_INPUT) + folha de contato
 python frames_sheet.py --dir ../work/runs/NOME --at 125   # uma captura em tamanho real (cima + baixo)
+python pilot.py NOME --secs 300                          # guia o jogo sem janela pelo minimapa (YW_INPUT_FILE)
+python logs.py [latest | NOME [arquivo --tail 40]]       # logs de cada execução em work/logs/ (game/perf/gfx/dsp/input/stall.log)
+python soak.py --runs 9 --parallel 3                     # estresse: repete título→quarto e acusa travamentos
+python window_run.py NOME --secs 235 --input "$(cat ../work/runs/route_probe4.txt)" --set graficos.interpolacao=120
+                     # COM janela por N s (YW_WINDOW_SECS), sem som, numa CÓPIA do settings.toml; mede cadência/redesenhos
+                     # pelas linhas [janela] do log (interpolação: passos pulados, atraso troca→tela; envio das telas)
 cd engine && cargo test --release --lib -- --ignored pica_frame --nocapture   # renderizador vs captura do Azahar
 ```
 Código gerado = derivado do jogo → só em `work/`, nunca versionar. O motor manual abaixo está congelado.
-Meta atual: jogo recompilado jogável até o capítulo 3 (DX12 adiado). Janela do jogo recompilado: Esc/F1 = menu (configurações em
+Meta atual: jogo recompilado jogável até o capítulo 3 (DX12 adiado). Janela do jogo recompilado: Esc/F1 = menu (apresentação: V-Sync/Mailbox/Imediato, quadros em voo, teto de redesenhos ou desligados, interpolação de quadros
+limitada à taxa do monitor; YW_PRESENT/YW_SCALE/YW_FXAA/YW_FSR/YW_ANISO/YW_INTERP sobrescrevem; configurações em
 %APPDATA%/yw1/settings.toml); o motor antigo abaixo continua com Esc = sair. Build travando = partir o código gerado em mais
 pedaços/crates, nunca baixar opt-level (ver docs/RECOMP.md "Funções gigantes são partidas").
 

@@ -8,6 +8,9 @@
 //!    instrução já descoberta viram entradas extras (vtables, ponteiros de função, callbacks).
 //! 4. **Emissão**: um crate Rust por fatia de funções (`work/recomp/game_NN`), mais o crate `dispatch` com a tabela
 //!    endereço → função. As funções se chamam por símbolo (`#[no_mangle]`), então as fatias compilam em paralelo.
+//! 5. **Shaders de vértice AOT** (`shaders.rs`, `pica_glsl.rs`): os programas do PICA do jogo (`fix.xr`) traduzidos
+//!    para GLSL em `work/recomp/shaders/`; o `build.rs` do executável os compila para SPIR-V e o `main` os registra
+//!    no motor.
 //!
 //! O código gerado é derivado do jogo do usuário: fica em `work/` e nunca é versionado.
 //!
@@ -15,6 +18,9 @@
 //!       [--crates 24] [--stats]`
 
 mod arm;
+mod fa;
+mod pica_glsl;
+mod shaders;
 mod thumb;
 
 use arm::{translate, Flow, Image, Ins};
@@ -669,6 +675,24 @@ fn main() {
         return;
     }
 
+    // ganchos: índice de cada função (ordem de `funcs`, igual à das tabelas do `dispatch`) e instruções instrumentadas
+    // por `recomp/hooks.toml`. O bit `HOOK_ORIG` no pc de entrada significa "chamar a original" (`emit_func`): todo
+    // endereço guest tem de estar abaixo dele.
+    if let Some(a) = funcs.keys().chain(extra_entries.keys()).find(|&&a| a >= HOOK_ORIG) {
+        panic!("[recomp] entrada {a:#x} ≥ {HOOK_ORIG:#x}: o bit de \"chamar a original\" dos ganchos colidiria com ela");
+    }
+    let idx_of: HashMap<u32, u32> = funcs.keys().enumerate().map(|(i, &k)| (k, i as u32)).collect();
+    let hooks_path = arg(&args, "--hooks")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("hooks.toml"));
+    let hook_at = load_hooks(&hooks_path, &funcs);
+    println!(
+        "ganchos: {} funções com teste de entrada · {} instruções instrumentadas ({})",
+        funcs.len(),
+        hook_at.len(),
+        hooks_path.display()
+    );
+
     // 4. emissão
     std::fs::create_dir_all(&out).unwrap();
     write_if_changed(out.join("stats.txt"), &report).unwrap();
@@ -713,11 +737,18 @@ fn main() {
         )
         .unwrap();
         let mut src = String::with_capacity(per * 120);
-        src.push_str("//! Gerado por yw1-recomp a partir do code.bin do usuário — não editar, não versionar.\n#![allow(unused, unreachable_code, unused_unsafe, non_snake_case, clippy::all)]\nuse yw1_rt::{self as rt, Cpu};\n\n/// pc devolvido pelos pedaços de uma função gigante quando ela retorna\nconst DONE: u32 = u32::MAX;\n\n");
+        src.push_str("//! Gerado por yw1-recomp a partir do code.bin do usuário — não editar, não versionar.\n#![allow(unused, unreachable_code, unused_unsafe, non_snake_case, clippy::all)]\nuse std::sync::atomic::{AtomicU8, Ordering::Relaxed};\nuse yw1_rt::{self as rt, Cpu};\n\n/// pc devolvido pelos pedaços de uma função gigante quando ela retorna\nconst DONE: u32 = u32::MAX;\n\n");
+        // ganchos (engine/src/hle/hooks.rs): byte "tem gancho" por função (no crate `dispatch`) e as entradas do motor
+        writeln!(
+            src,
+            "extern \"Rust\" {{\n    static YW1_HOOKED: [AtomicU8; {}];\n    fn yw1_hook_entry(c: &mut Cpu, idx: u32, ret: u32) -> bool;\n    fn yw1_hook_at(c: &mut Cpu, va: u32);\n}}\n",
+            funcs.len()
+        )
+        .unwrap();
         let mut ext = BTreeSet::new();
         let mut body = String::new();
         for f in s {
-            emit_func(f, &funcs, &crate_of, i, &mut ext, &mut body);
+            emit_func(f, &funcs, &crate_of, i, idx_of[&f.entry], &hook_at, &mut ext, &mut body);
         }
         if !ext.is_empty() {
             src.push_str("extern \"Rust\" {\n");
@@ -738,7 +769,7 @@ fn main() {
         format!("[package]\nname = \"yw1-dispatch\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\n{rt_dep}\n"),
     )
     .unwrap();
-    let mut d = String::from("//! Gerado por yw1-recomp — tabela endereço guest → função recompilada.\n#![allow(unused, clippy::all)]\nuse yw1_rt::Cpu;\n\nextern \"Rust\" {\n");
+    let mut d = String::from("//! Gerado por yw1-recomp — tabela endereço guest → função recompilada.\n#![allow(unused, clippy::all)]\nuse std::sync::atomic::AtomicU8;\nuse yw1_rt::{Cpu, GuestFn, HookTables};\n\nextern \"Rust\" {\n");
     for e in funcs.keys() {
         writeln!(d, "    fn f_{e:08x}(c: &mut Cpu, pc: u32, ret: u32);").unwrap();
     }
@@ -759,6 +790,27 @@ fn main() {
         writeln!(d, "        ({fe:#x}, {v:#x}),").unwrap();
     }
     d.push_str("    ]\n}\n");
+    // ganchos: byte por função (lido no cabeçalho de cada uma), tabela índice → (chave, função) e as instruções
+    // instrumentadas; o motor pega as três por `yw1_hook_tables` (engine/src/hle/hooks.rs)
+    let n = funcs.len();
+    writeln!(
+        d,
+        "\n/// Funções com teste de gancho na entrada (índice = posição em `yw1_hook_tables().funcs`).\npub const FUNCS: usize = {n};\n\nconst ZERO: AtomicU8 = AtomicU8::new(0);\n\n/// ≠ 0 = a função tem gancho de entrada registrado no motor (`hooks::registrar`/`remover` ligam e desligam).\n#[no_mangle]\npub static YW1_HOOKED: [AtomicU8; {n}] = [ZERO; {n}];\n\nstatic HOOK_FUNCS: [(u32, GuestFn); {n}] = ["
+    )
+    .unwrap();
+    for e in funcs.keys() {
+        writeln!(d, "    ({e:#x}, f_{e:08x}),").unwrap();
+    }
+    writeln!(
+        d,
+        "];\n\n/// Instruções instrumentadas por `recomp/hooks.toml` (gancho antes da instrução).\nstatic HOOK_AT: [u32; {}] = [",
+        hook_at.len()
+    )
+    .unwrap();
+    for (va, nome) in &hook_at {
+        writeln!(d, "    {va:#x}, // {nome}").unwrap();
+    }
+    d.push_str("];\n\n#[no_mangle]\npub fn yw1_hook_tables() -> HookTables {\n    HookTables { hooked: &YW1_HOOKED, funcs: &HOOK_FUNCS, at: &HOOK_AT }\n}\n");
     write_if_changed(dir.join("lib.rs"), d).unwrap();
     members.push("dispatch".into());
 
@@ -768,8 +820,11 @@ fn main() {
         "yw1 = {{ path = {:?} }}",
         engine_path.display().to_string().trim_start_matches(r"\\?\")
     );
+    // shaders de vértice AOT (work/recomp/shaders) e o build.rs do executável que os compila
+    shaders::generate(&root, &out);
     let app = out.join("app").join("src");
     std::fs::create_dir_all(&app).unwrap();
+    write_if_changed(out.join("app").join("build.rs"), include_str!("app_build.rs")).unwrap();
     let mut deps = format!("{engine_dep}\n{rt_dep}\nyw1-dispatch = {{ path = \"../dispatch\" }}\n");
     let mut uses = String::new();
     for m in members.iter().filter(|m| m.starts_with("game_")) {
@@ -785,7 +840,7 @@ fn main() {
     write_if_changed(
         app.join("main.rs"),
         format!(
-            "//! Gerado por yw1-recomp: executável do jogo recompilado (não versionar).\n{uses}extern crate yw1_dispatch;\n\nfn main() {{\n    yw1::hle::main();\n}}\n"
+            "//! Gerado por yw1-recomp: executável do jogo recompilado (não versionar).\n{uses}extern crate yw1_dispatch;\n\n/// shaders de vértice AOT compilados pelo build.rs (`../shaders`)\nmod aot {{\n    include!(concat!(env!(\"OUT_DIR\"), \"/aot.rs\"));\n}}\n\nfn main() {{\n    yw1::render::register_aot(aot::AOT);\n    yw1::hle::main();\n}}\n"
         ),
     )
     .unwrap();
@@ -838,11 +893,116 @@ fn call_expr(
     }
 }
 
+/// Proteções em instruções do jogo (endereço, condição para EXECUTAR a instrução, motivo). São correções de
+/// robustez do código recompilado, não mudanças de comportamento do jogo em condições normais.
+///
+/// 0x142118 — `FUN_001420a8` (enfileira um buffer de onda na fila do canal de áudio): `tail.next = nó`. Se o fim da
+/// lista já é o próprio nó (um nó livre, estado 3, que ainda era a cabeça da fila é reenfileirado), ligar `nó.next = nó`
+/// cria um ciclo e a travessia seguinte gira para sempre (travamento visto em `work/logs/soakA-09/stall.log`: cabeça
+/// `14374814` com estado 3 e próximo = ela mesma). Sem ligar, a lista fica só com o nó, que é o que se espera dele.
+const GUARDS: &[(u32, &str, &str)] = &[(0x142118, "c.r[0] != c.r[5]", "fila de áudio: não ligar o nó a si mesmo")];
+
+/// Sondas de rastreio na ENTRADA de funções do jogo (endereço, código Rust que chama `rt::trace`): alimentam o anel que o
+/// `[guard]`, o relatório de travamento e a queda por falha de memória despejam. Só a fila de buffers de áudio do SDK
+/// (nó: +0x14 próximo, +0x11 estado, +0x12 sequência; fila: +0x30 cabeça, +0x34 contagem, +0x04 sync esperado, +0x6f flag).
+/// São só depuração: mudanças de comportamento do jogo vão por ganchos do motor (`engine/src/hle/hooks.rs`; o modo
+/// mono, que era uma sonda aqui em `FUN_00114588`, virou gancho "antes" registrado no `hle::boot`).
+const TRACES: &[(u32, &str)] = &[
+    // FUN_001420a8(canal, nó): enfileira um buffer de onda
+    (
+        0x1420a8,
+        "{ let q = rt::r32(c.r[0].wrapping_add(0x68)); let n = c.r[1]; rt::audio_enqueue_check(c, q, n); rt::trace(c, 1, n, rt::r8(n.wrapping_add(0x11)) | rt::r16(n.wrapping_add(0x12)) << 8, rt::r32(q.wrapping_add(0x30)), rt::r16(q.wrapping_add(0x34)), q); }",
+    ),
+    // FUN_00141f40(global, fonte, status do DSP): processa o estado que o DSP devolveu
+    (
+        0x141f40,
+        "{ let q = rt::r32(rt::r32(c.r[0].wrapping_add(c.r[1].wrapping_mul(4)).wrapping_add(0x15dc)).wrapping_add(0x68)); let st = c.r[2]; rt::jitter(); rt::audio_check(c, q, \"status do DSP (0x141f40)\"); rt::trace(c, 2, c.r[1], rt::r16(st) | rt::r16(st.wrapping_add(2)) << 16, rt::r32(q.wrapping_add(0x30)), rt::r16(st.wrapping_add(8)) | rt::r16(st.wrapping_add(10)) << 16, rt::r16(q.wrapping_add(0x34)) | rt::r16(q.wrapping_add(4)) << 16); }",
+    ),
+    // FUN_00140024(fila): para/limpa a fila
+    (
+        0x140024,
+        "{ let q = c.r[0]; rt::trace(c, 3, q, 0, rt::r32(q.wrapping_add(0x30)), rt::r16(q.wrapping_add(0x34)), 0); }",
+    ),
+    // FUN_0014214c(fila, ...): atualiza a fila (envia buffers ao DSP)
+    (
+        0x14214c,
+        "{ let q = c.r[0]; rt::audio_check(c, q, \"atualização (0x14214c)\"); let h = rt::r32(q.wrapping_add(0x30)); let hs = if h != 0 { rt::r8(h.wrapping_add(0x11)) } else { 0xff }; rt::trace(c, 4, q, rt::r8(q.wrapping_add(0x6f)) | hs << 8, h, rt::r16(q.wrapping_add(0x34)), rt::r16(q.wrapping_add(0x36))); }",
+    ),
+];
+
+fn trace_probe(entry: u32) -> &'static str {
+    TRACES.iter().find(|t| t.0 == entry).map_or("", |t| t.1)
+}
+
+/// pc de entrada + este bit = "chamar a original" (pula o gancho de entrada só nessa chamada); igual a
+/// `yw1_rt::HOOK_ORIG` (o gerador não depende do `rt`).
+const HOOK_ORIG: u32 = 0x8000_0000;
+
+/// Lê `recomp/hooks.toml` (`[[at]]` com `va`, `nome`, `motivo`): instruções que recebem `yw1_hook_at(c, va)` antes
+/// delas. Falha se o va não for o início de uma instrução decodificada (ou se repetir). Devolve va → nome.
+fn load_hooks(path: &Path, funcs: &BTreeMap<u32, Func>) -> BTreeMap<u32, String> {
+    let mut out = BTreeMap::new();
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[recomp] aviso: {} não existe; nenhum gancho em instrução", path.display());
+            return out;
+        }
+        Err(e) => panic!("[recomp] {}: {e}", path.display()),
+    };
+    let doc: toml::Table = src.parse().unwrap_or_else(|e| panic!("[recomp] {}: {e}", path.display()));
+    if let Some(k) = doc.keys().find(|k| *k != "at") {
+        panic!("[recomp] {}: chave desconhecida `{k}` (só há `[[at]]`)", path.display());
+    }
+    let Some(list) = doc.get("at") else {
+        return out;
+    };
+    let list = list
+        .as_array()
+        .unwrap_or_else(|| panic!("[recomp] {}: `at` tem de ser uma lista de tabelas (`[[at]]`)", path.display()));
+    for (n, item) in list.iter().enumerate() {
+        let t = item
+            .as_table()
+            .unwrap_or_else(|| panic!("[recomp] {}: at[{n}] não é tabela", path.display()));
+        let va = t
+            .get("va")
+            .and_then(|v| v.as_integer())
+            .filter(|&v| (0..HOOK_ORIG as i64).contains(&v))
+            .unwrap_or_else(|| panic!("[recomp] {}: at[{n}] sem `va` inteiro válido", path.display())) as u32;
+        let nome = t.get("nome").and_then(|v| v.as_str()).unwrap_or_else(|| {
+            panic!("[recomp] {}: at[{n}] ({va:#x}) sem `nome`", path.display())
+        });
+        if t.get("motivo").and_then(|v| v.as_str()).is_none_or(|m| m.trim().is_empty()) {
+            panic!("[recomp] {}: at[{n}] ({va:#x}, {nome}) sem `motivo`", path.display());
+        }
+        if !funcs.values().any(|f| f.insts.contains_key(&va)) {
+            panic!(
+                "[recomp] {}: gancho `{nome}` em {va:#x} não é início de nenhuma instrução decodificada{}",
+                path.display(),
+                if va & 1 == 1 { " (use o endereço par, sem o bit Thumb)" } else { "" }
+            );
+        }
+        if out.insert(va, nome.to_string()).is_some() {
+            panic!("[recomp] {}: gancho em {va:#x} repetido", path.display());
+        }
+    }
+    out
+}
+
+fn guard_body(pc: u32, body: &str) -> String {
+    match GUARDS.iter().find(|g| g.0 == pc) {
+        Some((_, cond, _)) => format!("if {cond} {{ {body} }} else {{ rt::guard_hit({pc:#x}); }}"),
+        None => body.to_string(),
+    }
+}
+
 fn emit_func(
     f: &Func,
     funcs: &BTreeMap<u32, Func>,
     crate_of: &HashMap<u32, usize>,
     me: usize,
+    idx: u32,
+    hook_at: &BTreeMap<u32, String>,
     ext: &mut BTreeSet<u32>,
     out: &mut String,
 ) {
@@ -862,9 +1022,13 @@ fn emit_func(
                 break;
             };
             let uncond = i.cond == 14;
+            // gancho em instrução (`recomp/hooks.toml`): antes dela, para qualquer fluxo, e mesmo se for condicional
+            if let Some(nome) = hook_at.get(&pc) {
+                writeln!(out, "                unsafe {{ yw1_hook_at(c, {pc:#x}) }}; // gancho: {nome}").unwrap();
+            }
             let s = match &i.flow {
                 Flow::CallInd => format!("{} c.func = {:#x};", i.body, f.entry),
-                Flow::Next => i.body.clone(),
+                Flow::Next => guard_body(pc, &i.body),
                 Flow::Undefined => {
                     writeln!(out, "                {}", i.body).unwrap();
                     break;
@@ -925,9 +1089,18 @@ fn emit_func(
         out.push_str("            }\n");
         blocks.push((l, std::mem::take(out)));
     }
+    // Cabeçalho. Gancho de entrada (engine/src/hle/hooks.rs) ANTES do `rt::poll`, para nenhuma troca de thread entre
+    // o gancho e a função: só numa chamada de verdade (pc = entrada; entradas extras não passam por ele) e só se o
+    // motor ligou o byte desta função. `yw1_hook_entry` devolve true quando já executou a função (substituiu, ou
+    // chamou a original e os "depois"). A original é chamada com pc = entrada | HOOK_ORIG: pula o gancho só nessa
+    // chamada (as recursivas voltam a passar por ele).
+    let epc = f.entry & !1;
     let head = format!(
-        "#[no_mangle]\npub fn f_{:08x}(c: &mut Cpu, mut pc: u32, ret: u32) {{\n    c.func = {:#x};\n    rt::poll(c);\n    loop {{\n",
-        f.entry, f.entry
+        "#[no_mangle]\npub fn f_{:08x}(c: &mut Cpu, mut pc: u32, ret: u32) {{\n    c.func = {:#x};\n    if pc == {epc:#x} {{\n        if unsafe {{ YW1_HOOKED[{idx}].load(Relaxed) }} != 0 && unsafe {{ yw1_hook_entry(c, {idx}, ret) }} {{\n            return;\n        }}\n    }} else if pc == {:#x} {{\n        pc = {epc:#x};\n    }}\n    rt::poll(c);\n    {}\n    loop {{\n",
+        f.entry,
+        f.entry,
+        epc | HOOK_ORIG,
+        trace_probe(f.entry)
     );
     if blocks.len() <= CHUNK_MAX {
         out.push_str(&head);
@@ -978,3 +1151,12 @@ fn emit_func(
 /// Funções com mais blocos que isto são partidas em pedaços de `CHUNK` blocos (ver `emit_func`).
 const CHUNK_MAX: usize = 1024;
 const CHUNK: usize = 384;
+
+#[cfg(test)]
+mod guard_tests {
+    #[test]
+    fn guard_wraps_only_listed_addresses() {
+        assert_eq!(super::guard_body(0x1000, "x();"), "x();");
+        assert_eq!(super::guard_body(0x142118, "x();"), "if c.r[0] != c.r[5] { x(); } else { rt::guard_hit(0x142118); }");
+    }
+}

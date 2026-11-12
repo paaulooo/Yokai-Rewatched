@@ -1,6 +1,7 @@
 #version 450
 // Vértices já sombreados, recortados e projetados na CPU (render::prepare): a posição chega pronta em coordenadas de
-// recorte do Vulkan (x, y com o viewport do PICA já aplicado e arredondado a 1/16 de pixel; z = profundidade·w).
+// recorte do Vulkan (x, y com o viewport do PICA já aplicado e arredondado a 1/16 de pixel; z = profundidade do
+// z-buffer·w — com w-buffer o pica.frag ainda divide por gl_FragCoord.w).
 // Este estágio só repassa os atributos; o Vulkan faz a interpolação com correção de perspectiva pelo w.
 
 layout(location = 0) in vec4 a_pos;

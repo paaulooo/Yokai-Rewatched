@@ -6,6 +6,8 @@ description = "Recompilador estático do code.bin (ARM11/ARMv6K + VFPv2) do Yo-k
 publish = false
 
 [dependencies]
+# recomp/hooks.toml (ganchos em instrução)
+toml = "1"
 
 [profile.release]
 opt-level = 3

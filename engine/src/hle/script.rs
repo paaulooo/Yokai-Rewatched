@@ -118,26 +118,53 @@ fn stick_word(s: Option<(f32, f32)>) -> (u32, u32) {
     (cx | cy << 16, b)
 }
 
-/// Thread que aplica o roteiro de `YW_INPUT` (se houver) seguindo o contador de VBlanks.
+/// Entrada "ao vivo" (`YW_INPUT_FILE`): arquivo de texto com UMA linha de itens separados por espaço
+/// (`a`, `up`, `stick(0,1)`, `touch(160,200)`…), relido a cada poucos ms. Linha vazia = nada apertado. Serve para
+/// controlar o jogo em malha fechada a partir de um programa externo que olha os quadros gravados.
+fn live_state(path: &str) -> State {
+    let Ok(txt) = std::fs::read_to_string(path) else { return (0, None, None) };
+    let ev: String = txt
+        .split_whitespace()
+        .map(|t| format!("0:{t}/1000000000"))
+        .collect::<Vec<_>>()
+        .join(";");
+    match parse(&ev) {
+        Ok(e) => state_at(&e, 1.0),
+        Err(_) => (0, None, None), // arquivo lido pela metade: ignora este instante
+    }
+}
+
+/// Thread que aplica o roteiro de `YW_INPUT` (se houver) seguindo o contador de VBlanks, somado à entrada ao vivo
+/// de `YW_INPUT_FILE` (se houver).
+/// Há um roteiro (`YW_INPUT`/`YW_INPUT_FILE`) mandando na entrada: a janela não sobrescreve botões/toque.
+pub static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn start_from_env() {
-    let Ok(s) = std::env::var("YW_INPUT") else {
+    let script = std::env::var("YW_INPUT").ok();
+    let live = std::env::var("YW_INPUT_FILE").ok();
+    if script.is_none() && live.is_none() {
         return;
-    };
-    let events = match parse(&s) {
+    }
+    let events = match script.as_deref().map(parse).unwrap_or(Ok(Vec::new())) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[input] YW_INPUT inválido: {e}");
             return;
         }
     };
-    eprintln!("[input] roteiro com {} eventos", events.len());
+    eprintln!("[input] roteiro com {} eventos{}", events.len(), if live.is_some() { " + entrada ao vivo" } else { "" });
+    ACTIVE.store(true, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("input-script".into())
         .spawn(move || {
             let mut prev: State = (0, None, None);
             loop {
-                let t = super::VBLANKS.load(Ordering::Relaxed) as f64 / super::VBLANK_HZ;
-                let now = state_at(&events, t);
+                let t = super::VBLANKS.load(Ordering::Relaxed) as f64 / super::vblank_hz();
+                let mut now = state_at(&events, t);
+                if let Some(p) = &live {
+                    let l = live_state(p);
+                    now = (now.0 | l.0, l.1.or(now.1), l.2.or(now.2));
+                }
                 if now != prev {
                     // mesma codificação da janela (window.rs): toque = x | y << 9 | válido << 31, e bit 20 nos botões
                     hid::TOUCH.store(now.1.map_or(0, |(x, y)| x | y << 9 | 1 << 31), Ordering::Relaxed);

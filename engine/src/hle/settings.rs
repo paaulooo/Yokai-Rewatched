@@ -72,15 +72,108 @@ pub enum Filtro {
     Nitido,
     /// bilinear
     Suave,
+    /// "sharp bilinear": amplia por um fator inteiro com vizinho mais próximo e só suaviza o resto até o tamanho da
+    /// janela — pixels nítidos sem a borda irregular da escala fracionária
+    Misto,
 }
 
 impl Filtro {
-    pub const ALL: [Filtro; 2] = [Filtro::Nitido, Filtro::Suave];
+    pub const ALL: [Filtro; 3] = [Filtro::Nitido, Filtro::Suave, Filtro::Misto];
     pub fn nome(self) -> &'static str {
         match self {
             Filtro::Nitido => "Nítido (pixels)",
             Filtro::Suave => "Suave (bilinear)",
+            Filtro::Misto => "Nítido suave (sharp bilinear)",
         }
+    }
+}
+
+/// Como os quadros da janela são entregues ao monitor (`VkPresentModeKHR`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Apresentacao {
+    /// V-Sync (FIFO): sem rasgo; um quadro novo do jogo espera o próximo ciclo do monitor
+    Vsync,
+    /// Mailbox: sem rasgo e o monitor mostra sempre o quadro mais recente (latência menor que o V-Sync). Se a GPU
+    /// não oferece, cai no V-Sync
+    #[default]
+    Caixa,
+    /// Imediato: sem espera nenhuma (menor latência possível, pode rasgar). Se a GPU não oferece, cai no que o
+    /// driver tiver sem V-Sync
+    SemSincronia,
+}
+
+impl Apresentacao {
+    pub const ALL: [Apresentacao; 3] = [Apresentacao::Vsync, Apresentacao::Caixa, Apresentacao::SemSincronia];
+    pub fn nome(self) -> &'static str {
+        match self {
+            Apresentacao::Vsync => "V-Sync (FIFO)",
+            Apresentacao::Caixa => "Mailbox (latência baixa, sem rasgo)",
+            Apresentacao::SemSincronia => "Imediato (sem V-Sync, pode rasgar)",
+        }
+    }
+}
+
+/// Como o backend Vulkan executa os lotes do jogo. `Assincrona`: a GPU do PC trabalha em paralelo com a thread do
+/// jogo e a devolução para a memória do 3DS só espera quando alguém lê. `Sincrona`: cada lote é executado e esperado
+/// na hora (o comportamento antigo; reserva para comparar ou contornar problemas). Ninguém lê ainda (motor da F3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Renderizacao {
+    #[default]
+    Assincrona,
+    Sincrona,
+}
+
+impl Renderizacao {
+    pub const ALL: [Renderizacao; 2] = [Renderizacao::Assincrona, Renderizacao::Sincrona];
+    pub fn nome(self) -> &'static str {
+        match self {
+            Renderizacao::Assincrona => "Assíncrona (GPU em paralelo com o jogo)",
+            Renderizacao::Sincrona => "Síncrona (espera cada lote; mais lenta)",
+        }
+    }
+}
+
+/// Teto de redesenhos por segundo da janela (menu, mouse e cópia das telas). O jogo em si anda sempre na
+/// velocidade do console; um quadro novo do jogo (ou o próximo passo da interpolação) é apresentado assim que chega,
+/// qualquer que seja este teto. `Desligado`: a janela só redesenha quando há imagem nova (com o menu aberto, a 60/s);
+/// a entrada continua sendo lida a cada milissegundo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimiteFps {
+    Desligado,
+    F60,
+    #[default]
+    F120,
+    F144,
+    F240,
+    Livre,
+}
+
+impl LimiteFps {
+    pub const ALL: [LimiteFps; 6] = [LimiteFps::Desligado, LimiteFps::F60, LimiteFps::F120, LimiteFps::F144, LimiteFps::F240, LimiteFps::Livre];
+    pub fn nome(self) -> &'static str {
+        match self {
+            LimiteFps::Desligado => "desligados (só imagem nova)",
+            LimiteFps::F60 => "60",
+            LimiteFps::F120 => "120",
+            LimiteFps::F144 => "144",
+            LimiteFps::F240 => "240",
+            LimiteFps::Livre => "sem limite",
+        }
+    }
+    /// Intervalo mínimo entre redesenhos (`Livre` = 1 ms, para não ocupar um núcleo inteiro à toa; `Desligado` = o
+    /// ritmo usado só com o menu aberto).
+    pub fn intervalo(self) -> std::time::Duration {
+        let hz = match self {
+            LimiteFps::Desligado | LimiteFps::F60 => 60.0,
+            LimiteFps::F120 => 120.0,
+            LimiteFps::F144 => 144.0,
+            LimiteFps::F240 => 240.0,
+            LimiteFps::Livre => 1000.0,
+        };
+        std::time::Duration::from_secs_f64(1.0 / hz)
     }
 }
 
@@ -470,6 +563,32 @@ pub struct Graficos {
     pub mostrar_fps: bool,
     /// tela cheia sem borda (F11)
     pub tela_cheia: bool,
+    /// modo de apresentação da janela (V-Sync, Mailbox, imediato)
+    pub apresentacao: Apresentacao,
+    /// quadros que o sistema pode enfileirar à frente (1 = latência mínima, 3 = mais folga contra engasgos)
+    pub quadros_em_voo: u32,
+    /// teto de redesenhos da janela por segundo
+    pub limite_fps: LimiteFps,
+    /// filtro anisotrópico das texturas no Vulkan: 0 (desligado, como o PICA real), 2, 4, 8 ou 16 amostras
+    pub anisotropico: u32,
+    /// resolução interna: a cena 3D das telas é desenhada em N× (1 = nativa, até 6); só no renderizador Vulkan
+    pub escala_interna: u32,
+    /// FXAA só na cena 3D (nunca no texto/HUD); só no renderizador Vulkan
+    pub fxaa: bool,
+    /// FSR 1 (EASU + RCAS) ao ampliar as telas para a janela (só quando a janela é maior que a imagem)
+    pub fsr: bool,
+    /// nitidez do FSR 1 (RCAS), 0–100
+    pub fsr_nitidez: u32,
+    /// interpolação de quadros: taxa de saída em Hz (0 = desligada; 60, 90, 120, 144, 180); só no renderizador Vulkan
+    #[serde(default)]
+    pub interpolacao: u32,
+    /// 3D estéreo: o jogo desenha também o olho direito (que a janela não mostra). Desligado = modo mono do console
+    /// (metade do trabalho de GPU na tela de cima). Vale ao reiniciar (o jogo escolhe o modo no boot)
+    #[serde(default)]
+    pub estereo_3d: bool,
+    /// execução dos lotes no Vulkan: assíncrona (padrão) ou síncrona
+    #[serde(default)]
+    pub renderizacao: Renderizacao,
 }
 
 impl Default for Graficos {
@@ -482,6 +601,17 @@ impl Default for Graficos {
             escala_janela: 2,
             mostrar_fps: false,
             tela_cheia: false,
+            apresentacao: Apresentacao::default(),
+            quadros_em_voo: 1,
+            limite_fps: LimiteFps::default(),
+            anisotropico: 0,
+            escala_interna: 1,
+            fxaa: false,
+            fsr: false,
+            fsr_nitidez: 90,
+            interpolacao: 0,
+            estereo_3d: false,
+            renderizacao: Renderizacao::Assincrona,
         }
     }
 }
@@ -763,6 +893,24 @@ impl EnvOverrides {
 mod tests {
     use super::*;
 
+    /// Arquivo gravado antes das opções de apresentação existirem: carrega e usa os padrões novos.
+    #[test]
+    fn arquivo_antigo_sem_opcoes_de_apresentacao() {
+        let s: Settings = toml::from_str("[graficos]
+renderizador = \"vulkan\"
+escala_janela = 3
+").unwrap();
+        assert_eq!(s.graficos.escala_janela, 3);
+        assert_eq!(s.graficos.apresentacao, Apresentacao::Caixa);
+        assert_eq!(s.graficos.quadros_em_voo, 1);
+        assert_eq!(s.graficos.limite_fps, LimiteFps::F120);
+        assert_eq!(s.graficos.anisotropico, 0, "anisotrópico começa desligado (o PICA real não tem)");
+        assert_eq!((s.graficos.escala_interna, s.graficos.fxaa, s.graficos.fsr), (1, false, false));
+        assert!(!s.graficos.estereo_3d, "3D estéreo começa desligado (modo mono)");
+        assert_eq!(s.graficos.renderizacao, Renderizacao::Assincrona);
+        assert!(LimiteFps::Livre.intervalo() < LimiteFps::F240.intervalo());
+    }
+
     #[test]
     fn toml_ida_e_volta() {
         let mut s = Settings::default();
@@ -777,8 +925,11 @@ mod tests {
         s.controle.set_layout(PadLayout::Nintendo);
         s.controle.assign(Botao::L, Pad::LeftThumb);
         s.emulacao.idioma = Idioma::Espanhol;
+        s.graficos.estereo_3d = true;
+        s.graficos.renderizacao = Renderizacao::Sincrona;
         let txt = s.to_toml();
         assert!(txt.contains("[graficos]") && txt.contains("layout = \"grande_pequena\""), "{txt}");
+        assert!(txt.contains("renderizacao = \"sincrona\""), "{txt}");
         assert!(txt.contains("KeyP"), "{txt}");
         assert_eq!(Settings::from_toml(&txt).unwrap(), s);
     }
