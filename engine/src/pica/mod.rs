@@ -56,6 +56,10 @@ pub struct State {
     /// muda a cada escrita no código/descritores do shader de vértice (o backend de GPU só recalcula o hash do
     /// programa quando ela muda); única no processo, inclusive entre `State`s diferentes
     pub prog_gen: u64,
+    /// etiquetas por disparo de draw da lista em execução (`None` fora de uma lista com etiquetas) e se a lista teve
+    /// as etiquetas descartadas; `etiq_n` = disparos já vistos
+    etiq: Option<(Vec<Option<crate::hle::etiquetas::EtiqDraw>>, bool)>,
+    etiq_n: usize,
 }
 
 static PROG_GEN: AtomicU64 = AtomicU64::new(1);
@@ -75,6 +79,8 @@ impl State {
             fixed_n: 0,
             fixed_attr: [[0.0, 0.0, 0.0, 1.0]; 16],
             prog_gen: next_prog_gen(),
+            etiq: None,
+            etiq_n: 0,
         }
     }
 }
@@ -98,13 +104,34 @@ pub fn read_list(addr: u32, size: u32) -> Vec<u32> {
 
 /// Executa uma lista já copiada (a GPU assíncrona copia no despacho: o jogo pode reescrever o buffer depois).
 pub fn execute_words(words: &[u32]) {
-    timed(0, || execute_inner(words))
+    timed(0, || execute_inner(words, None))
 }
 
-fn execute_inner(words: &[u32]) {
+/// Como `execute_words`, com as etiquetas de draw do jogo da faixa da lista (G1, `hle/etiquetas.rs`): `base` = endereço
+/// guest da lista. Cada disparo de draw recebe a sua etiqueta (ou nenhuma) em `etiquetas::draw_atual` enquanto é
+/// desenhado — na própria thread que desenha, sem estado entre threads.
+pub fn execute_words_etiq(base: u32, words: &[u32], et: Option<&crate::hle::etiquetas::EtiqLista>) {
+    use crate::hle::etiquetas as e;
+    let por_draw = et.and_then(|l| match e::casar(base, words, l) {
+        Ok(v) => {
+            e::N_CASADAS.fetch_add(l.itens.len() as u64, Ordering::Relaxed);
+            Some((v, false))
+        }
+        Err(m) => {
+            e::lista_ruim(base, &m);
+            Some((Vec::new(), true))
+        }
+    });
+    timed(0, || execute_inner(words, por_draw));
+    e::set_draw_atual(e::Atual::default());
+}
+
+fn execute_inner(words: &[u32], etiq: Option<(Vec<Option<crate::hle::etiquetas::EtiqDraw>>, bool)>) {
     LISTS.fetch_add(1, Ordering::Relaxed);
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(State::new);
+    st.etiq_n = 0;
+    st.etiq = etiq;
     let draws_before = DRAWS.load(Ordering::Relaxed);
     let mut p = 0usize;
     while p + 2 <= words.len() {
@@ -124,6 +151,7 @@ fn execute_inner(words: &[u32]) {
             p += 1;
         }
     }
+    st.etiq = None;
     // backend de GPU: devolve os render targets para a memória guest antes do GSP continuar
     if DRAWS.load(Ordering::Relaxed) != draws_before {
         timed(3, crate::render::end_list);
@@ -143,8 +171,17 @@ fn write_reg(st: &mut State, reg: u32, val: u32, mask: u32) {
         0x22e | 0x22f => {
             if val != 0 || reg == 0x22f || reg == 0x22e {
                 DRAWS.fetch_add(1, Ordering::Relaxed);
+                // etiqueta do jogo deste disparo (mesma ordem de `etiquetas::disparos`)
+                if let Some((v, ruim)) = &st.etiq {
+                    let et = v.get(st.etiq_n).copied().flatten();
+                    crate::hle::etiquetas::set_draw_atual(crate::hle::etiquetas::Atual { et, ruim: *ruim });
+                    st.etiq_n += 1;
+                }
                 if enabled() {
                     draw(st, reg == 0x22f);
+                }
+                if st.etiq.is_some() {
+                    crate::hle::etiquetas::set_draw_atual(crate::hle::etiquetas::Atual::default());
                 }
             }
         }
@@ -442,7 +479,122 @@ fn context(r: &[u32]) -> Ctx {
         blend_fac: [(bf >> 16) & 0xf, (bf >> 20) & 0xf, (bf >> 24) & 0xf, (bf >> 28) & 0xf],
         blend_color: r[0x103].to_le_bytes(),
         logic_op: r[0x102] & 0xf,
+        larga: crate::render::LARGA_NADA,
+        ancora: 0.0,
     }
+}
+
+/// Widescreen (G3): classe de um draw da tela de cima (`render::LARGA_*`).
+/// - Projeção perspectiva em c0..c3 (a linha w = c3 tem x/y/z ≠ 0 e w = 0; o jogo põe a projeção da câmera em c0..c3,
+///   `FUN_00129d28`, confirmado no passo 0: c3 = (0, 0, −1, 0) na perspectiva e (0, 0, 0, 1) na ortográfica) → cena.
+/// - Senão (2D): roda o shader de vértice na CPU em até 16 vértices distintos; se eles cobrem toda a horizontal da tela
+///   (os 400, com folga de 1 pixel) e ≥ 2/3 da vertical, e o quadro tem cena 3D ou o draw não tem textura (cor chapada)
+///   → tela cheia (estica); senão 2D central (a arte das telas só 2D — título, aviso, vídeo — não deforma). Mais de 16
+///   vértices = 2D central.
+fn classe_larga(st: &State, ctx: &Ctx, idx: &[u32], hud: bool) -> (u8, Option<[f32; 4]>) {
+    use crate::render::{LARGA_2D, LARGA_CENA, LARGA_CHEIA, LARGA_NADA};
+    let alto = ctx.height_m1 + 1;
+    if alto != 400 || !(ctx.width == 240 || ctx.width == 480) {
+        return (LARGA_NADA, None);
+    }
+    let c3 = st.vs.f[3];
+    if c3[3] == 0.0 && (c3[0] != 0.0 || c3[1] != 0.0 || c3[2] != 0.0) {
+        crate::render::CENA_QUADRO.store(true, Ordering::Relaxed);
+        return (LARGA_CENA, None);
+    }
+    // até 16 vértices distintos para a tela cheia; com a HUD ancorada (G5) a caixa de todo draw 2D (até 1024)
+    let Some([x0, y0, x1, y1]) = caixa_2d(st, ctx, idx, if hud { 1024 } else { 16 }) else {
+        larga_log(ctx, idx.len(), None, LARGA_2D);
+        return (LARGA_2D, None);
+    };
+    let bbox = Some([x0, y0, x1, y1]);
+    let mut uniq = 0;
+    let mut vistos: Vec<u32> = Vec::with_capacity(17);
+    for &i in idx {
+        if !vistos.contains(&i) {
+            vistos.push(i);
+            uniq += 1;
+            if uniq > 16 {
+                break;
+            }
+        }
+    }
+    if uniq > 16 {
+        larga_log(ctx, idx.len(), bbox, LARGA_2D);
+        return (LARGA_2D, bbox);
+    }
+    let (w, h) = (ctx.width as f32, alto as f32);
+    // tela cheia: estica com cena 3D neste quadro ou no anterior (ver `render::CENA_QUADRO`) ou se é cor chapada (sem
+    // textura: fade, fundo preto do "carregando" — esticar não deforma nada); arte de tela cheia numa tela só 2D
+    // (título, aviso, vídeo) fica no 5:3 central
+    let sem_textura = ctx.tex.iter().all(|t| t.is_none());
+    let cena = sem_textura || crate::render::CENA_QUADRO.load(Ordering::Relaxed) || crate::render::CENA_ANTERIOR.load(Ordering::Relaxed);
+    // "tela cheia" = toda a horizontal da tela (o eixo y do alvo, 400) e pelo menos 2/3 da vertical (o x do alvo):
+    // medido na rua, o véu aditivo sobre a cena cobre x 30..480 de 480 (94 %); a faixa do "Objetivo" (y 0..400,
+    // x −6..58: 13 %) e o texto ficam no 5:3 central
+    let c = if cena && y0 <= 1.0 && y1 >= h - 1.0 && (x1.min(w) - x0.max(0.0)) >= w * 2.0 / 3.0 { LARGA_CHEIA } else { LARGA_2D };
+    larga_log(ctx, idx.len(), bbox, c);
+    (c, bbox)
+}
+
+/// Caixa (x0, y0, x1, y1) no alvo de um draw 2D, rodando o shader de vértice na CPU em até `max` vértices distintos
+/// (`None` = mais que isso, ou w inválido).
+fn caixa_2d(st: &State, ctx: &Ctx, idx: &[u32], max: usize) -> Option<[f32; 4]> {
+    let mut uniq: Vec<u32> = Vec::with_capacity(max.min(64));
+    if max <= 16 {
+        for &i in idx {
+            if !uniq.contains(&i) {
+                if uniq.len() == max {
+                    return None;
+                }
+                uniq.push(i);
+            }
+        }
+    } else {
+        let mut v = idx.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        if v.len() > max {
+            return None;
+        }
+        uniq = v;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &index in &uniq {
+        let mut e = Exec::new(&st.vs);
+        load_vertex(st, index, &mut e.input);
+        e.run();
+        let p = output_vertex(st, &e.out).pos;
+        if !(p[3].is_finite() && p[3].abs() > 1e-6) {
+            return None;
+        }
+        // viewport do PICA (como o Vulkan: x = vp[2] + (x/w + 1)·vp[0])
+        let x = ctx.vp[2] + (p[0] / p[3] + 1.0) * ctx.vp[0];
+        let y = ctx.vp[3] + (p[1] / p[3] + 1.0) * ctx.vp[1];
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    (x0 <= x1).then_some([x0, y0, x1, y1])
+}
+
+/// `YW_LARGA_LOG=N`: as N primeiras classificações de draws 2D da tela de cima (diagnóstico do widescreen).
+fn larga_log(ctx: &Ctx, nidx: usize, bbox: Option<[f32; 4]>, c: u8) {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let max = *MAX.get_or_init(|| std::env::var("YW_LARGA_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if max == 0 || N.fetch_add(1, Ordering::Relaxed) >= max {
+        return;
+    }
+    let t = ctx.tex[0].as_ref().map(|t| format!("{:#x} {}x{} fmt {}", t.addr, t.w, t.h, t.format)).unwrap_or_else(|| "-".into());
+    eprintln!(
+        "[larga] classe {c} · {nidx} índices · bbox {:?} · dtest {} dwrite {} · blend {} {:?} · tex0 {t} · vp {:?} · alvo {:#x}",
+        bbox.map(|b| b.map(|v| (v * 10.0).round() / 10.0)),
+        ctx.depth_test,
+        ctx.depth_write,
+        ctx.blend,
+        ctx.blend_fac,
+        ctx.vp,
+        ctx.color_addr
+    );
 }
 
 /// Já apareceu um draw com w-buffer (log uma vez).
@@ -485,7 +637,7 @@ fn draw(st: &mut State, indexed: bool) {
     if n == 0 || n > 0x10_0000 {
         return;
     }
-    let ctx = context(r);
+    let mut ctx = context(r);
     if ctx.color_addr == 0 && ctx.depth_addr == 0 {
         return;
     }
@@ -516,15 +668,6 @@ fn draw(st: &mut State, indexed: bool) {
             s.store(0, Ordering::Relaxed);
         }
     }
-    let gpu = crate::render::backend() == crate::render::Backend::Vulkan;
-    let mut gpu_verts: Vec<crate::render::GpuVtx> = Vec::new();
-    let mut tri = |a: &Vtx, b: &Vtx, c: &Vtx| {
-        if gpu {
-            crate::render::prepare(&ctx, a, b, c, &mut gpu_verts);
-        } else {
-            raster::triangle(&ctx, a, b, c);
-        }
-    };
     // índices → vértices distintos (tabela densa pela faixa de índices) → shader de vértice em paralelo quando há
     // muitos (cada vértice é independente; mesmo resultado bit a bit) → montagem de primitivas na ordem original
     let idx: Vec<u32> = (0..n)
@@ -548,6 +691,21 @@ fn draw(st: &mut State, indexed: bool) {
         bad_draw("vértices fora da memória mapeada");
         return;
     }
+    // widescreen da tela de cima (G3): o renderizador põe a cena na largura inteira e o 2D no retângulo 5:3 central
+    if crate::render::wide_active() {
+        let hud = crate::render::hud_ativa();
+        let (c, caixa) = classe_larga(st, &ctx, &idx, hud);
+        ctx.larga = c;
+        crate::render::LARGA_CONT[ctx.larga as usize & 3].fetch_add(1, Ordering::Relaxed);
+        // HUD ancorada (G5): o 2D central vai para a borda do seu grupo
+        // — só no alvo que vai para a tela (o jogo também desenha texto em texturas 400×240, ex. o nome no balão, e
+        // ancorar letra a letra ali desalinharia a textura) e só sobre a cena 3D (HUD do jogo): numa tela só 2D (menu,
+        // título, nome) a arte de fundo fica no 5:3 central e os elementos ficam com ela
+        let cena = crate::render::CENA_QUADRO.load(Ordering::Relaxed) || crate::render::CENA_ANTERIOR.load(Ordering::Relaxed);
+        if hud && cena && c == crate::render::LARGA_2D && crate::hle::widescreen::hud::alvo_da_tela(ctx.color_addr) {
+            ctx.ancora = crate::hle::widescreen::hud::ancora(&ctx, caixa);
+        }
+    }
     // shader de vértice na GPU: a CPU só traduz os registradores; se o draw não couber nesse caminho, segue abaixo
     if crate::render::gpu_vs() {
         let prep = timed(1, || vs_gpu::prepare(st, &ctx, &idx, lo, hi, topo));
@@ -569,6 +727,15 @@ fn draw(st: &mut State, indexed: bool) {
             }
         }
     }
+    let gpu = crate::render::backend() == crate::render::Backend::Vulkan;
+    let mut gpu_verts: Vec<crate::render::GpuVtx> = Vec::new();
+    let mut tri = |a: &Vtx, b: &Vtx, c: &Vtx| {
+        if gpu {
+            crate::render::prepare(&ctx, a, b, c, &mut gpu_verts);
+        } else {
+            raster::triangle(&ctx, a, b, c);
+        }
+    };
     let mut slot = vec![u32::MAX; (hi - lo) as usize + 1];
     let mut uniq: Vec<u32> = Vec::new();
     for &i in &idx {

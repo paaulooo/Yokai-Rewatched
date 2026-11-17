@@ -136,6 +136,12 @@ pub fn present_hires(req: vulkan::PresentReq) {
 /// Primeiro passo da imagem N× (PPF adiantado): roda ANTES de o GSP sinalizar o fim do DisplayTransfer, enquanto o
 /// alvo e as texturas do quadro ainda estão intactos. `None` = nada a fazer depois (sem Vulkan, sem sombra…).
 pub fn present_hires_check(req: vulkan::PresentReq) -> Option<vulkan::PresentChecked> {
+    if req.ih == 400 {
+        CENA_ANTERIOR.store(CENA_QUADRO.swap(false, Ordering::Relaxed), Ordering::Relaxed);
+        if hud_ativa() {
+            crate::hle::widescreen::hud::fim_quadro(req.inp);
+        }
+    }
     if backend() == Backend::Vulkan && hires_on() {
         // PROF[6]: imagem final em N× + intermediários da interpolação (linha de desempenho do log)
         crate::pica::timed(6, || vulkan::present_hires_check(req))
@@ -398,8 +404,117 @@ pub fn set_hires_force(on: bool) {
 
 /// O backend Vulkan mantém a sombra N× dos alvos de tela?
 pub fn hires_on() -> bool {
-    scale() > 1 || fxaa() || HIRES_FORCE.load(Ordering::Relaxed) != 0 || interp_target() > 0 || vulkan::interp_capturing()
+    scale() > 1 || fxaa() || HIRES_FORCE.load(Ordering::Relaxed) != 0 || interp_target() > 0 || vulkan::interp_capturing() || wide_active()
 }
+
+/// Proporção da tela de cima no 3DS (400×240).
+pub const ASPECTO_ORIGINAL: f32 = 5.0 / 3.0;
+/// Bits f32 da proporção pedida (largura/altura da tela de cima); `u32::MAX` = ainda não lida de `YW_ASPECT`.
+static ASPECT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Lê uma proporção `L:A` (ex.: `16:9`), `original`/`5:3` ou um número (`1.78`). `None` = texto inválido ou "janela"
+/// (esta é decidida pela janela, que chama `set_aspect`).
+pub fn parse_aspect(t: &str) -> Option<f32> {
+    let t = t.trim();
+    if t.eq_ignore_ascii_case("original") {
+        return Some(ASPECTO_ORIGINAL);
+    }
+    let v = match t.split_once(':') {
+        Some((a, b)) => a.trim().parse::<f32>().ok()? / b.trim().parse::<f32>().ok()?,
+        None => t.parse::<f32>().ok()?,
+    };
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// Widescreen (G3): proporção largura/altura da tela de cima que a janela mostra. `ASPECTO_ORIGINAL` = como no 3DS.
+/// `YW_ASPECT` define o valor inicial (`16:9`, `21:9`, `5:3`…); a janela usa `set_aspect` (menu / "seguir a janela").
+pub fn aspect() -> f32 {
+    match ASPECT.load(Ordering::Relaxed) {
+        u32::MAX => {
+            let a = std::env::var("YW_ASPECT").ok().and_then(|v| parse_aspect(&v)).unwrap_or(ASPECTO_ORIGINAL);
+            set_aspect(a);
+            aspect()
+        }
+        b => f32::from_bits(b),
+    }
+}
+
+/// Limita a 4:3–32:9 e arredonda a 1/1000 (o "seguir a janela" não recria as sombras a cada pixel do redimensionamento).
+pub fn set_aspect(a: f32) {
+    let a = if a.is_finite() { a.clamp(4.0 / 3.0, 32.0 / 9.0) } else { ASPECTO_ORIGINAL };
+    let a = if (a - ASPECTO_ORIGINAL).abs() < 1e-3 { ASPECTO_ORIGINAL } else { (a * 1000.0).round() / 1000.0 };
+    ASPECT.store(a.to_bits(), Ordering::Relaxed);
+}
+
+/// Widescreen em efeito: proporção ≠ original, backend Vulkan JÁ em uso (o soft não tem sombra: a imagem nativa sairia
+/// comprimida) e os ganchos do jogo registrados (`hle::widescreen`). Não inicializa o backend.
+pub fn wide_active() -> bool {
+    decode(BACKEND.load(Ordering::Relaxed)) == Some(Backend::Vulkan)
+        && aspect() != ASPECTO_ORIGINAL
+        && crate::hle::widescreen::ganchos_ok()
+}
+
+/// Largura da tela de cima, em pixels da sombra N×: `round(240·N·proporção)` com widescreen, senão `400·N`.
+pub fn wide_px(n: u32) -> u32 {
+    if wide_active() {
+        ((240 * n) as f32 * aspect()).round().max(1.0) as u32
+    } else {
+        400 * n
+    }
+}
+
+/// Largura (pixels nativos, fracionária) que o jogo usa no aspecto da projeção da tela de cima: a mesma da sombra
+/// (`wide_px(N)/N`), para a cena sair exatamente sem esticar. `None` = sem widescreen.
+pub fn wide_game_w() -> Option<f32> {
+    if !wide_active() {
+        return None;
+    }
+    let n = scale();
+    Some(wide_px(n) as f32 / n as f32)
+}
+
+/// HUD ancorada nas bordas no widescreen (G5): 2 = ainda não lida de `YW_HUD_ANCORA`.
+static HUD_ANCORA: AtomicU8 = AtomicU8::new(2);
+
+/// HUD da tela de cima ancorada nas bordas da imagem larga (G5; padrão ligado). `YW_HUD_ANCORA=0` define o valor
+/// inicial (HUD inteira no 5:3 central, como na G3); o menu troca com [`set_hud_ancorada`]. Vale na hora.
+pub fn hud_ancorada() -> bool {
+    match HUD_ANCORA.load(Ordering::Relaxed) {
+        2 => {
+            let on = std::env::var("YW_HUD_ANCORA").map_or(true, |v| v != "0");
+            set_hud_ancorada(on);
+            on
+        }
+        v => v != 0,
+    }
+}
+
+pub fn set_hud_ancorada(on: bool) {
+    HUD_ANCORA.store(on as u8, Ordering::Relaxed);
+}
+
+/// A âncora da HUD está em efeito: widescreen ativo e a opção ligada.
+pub fn hud_ativa() -> bool {
+    wide_active() && hud_ancorada()
+}
+
+/// Widescreen: houve draw de cena (perspectiva) na tela de cima neste quadro / no anterior (o quadro vira no
+/// DisplayTransfer da tela de cima, `present_hires_check`). Um 2D de tela cheia só estica quando há cena (fade ou filtro
+/// sobre o 3D, céu atrás dele); numa tela só 2D (título, aviso, vídeo) ele fica no 5:3 central, sem deformar a arte.
+pub static CENA_QUADRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CENA_ANTERIOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draws da tela de cima classificados para o widescreen, por classe (`LARGA_*`): diagnóstico (`hle::widescreen`).
+pub static LARGA_CONT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Classe de um draw da tela de cima para o widescreen (`Ctx::larga`, decidida em `pica::draw`).
+pub const LARGA_NADA: u8 = 0;
+/// cena (projeção perspectiva): usa a largura inteira (o jogo já mandou o frustum largo)
+pub const LARGA_CENA: u8 = 1;
+/// 2D (ortográfica): fica no retângulo 5:3 central (a G5 ancora nas bordas)
+pub const LARGA_2D: u8 = 2;
+/// 2D de tela cheia (cobre os 400×240: fades, filtros, fundos): estica até a largura nova
+pub const LARGA_CHEIA: u8 = 3;
 
 /// Amostras máximas do filtro anisotrópico (0 = desligado, 2, 4, 8 ou 16). `YW_ANISO` define o valor inicial; o menu
 /// o troca com `set_aniso`. Só o backend Vulkan usa (o PICA real não tem esse filtro; o soft é a referência exata).

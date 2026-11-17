@@ -3865,8 +3865,13 @@ dependencies = [
  "toml",
  "wgpu",
  "winit",
+ "yw1-modapi",
  "yw1-rt",
 ]
+
+[[package]]
+name = "yw1-modapi"
+version = "0.1.0"
 
 [[package]]
 name = "yw1-rt"

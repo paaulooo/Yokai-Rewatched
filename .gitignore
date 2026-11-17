@@ -11,3 +11,7 @@ romfs/
 engine/target/
 # Ghidra local (ferramenta, não versionar)
 ghidra_*_PUBLIC/
+# alvos de compilação da API de mods e dos mods de exemplo
+modapi/target/
+mods-exemplo/*/target/
+mods-exemplo/*/Cargo.lock

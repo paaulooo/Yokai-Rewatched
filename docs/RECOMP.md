@@ -825,3 +825,176 @@ Toda função recompilada aceita gancho na ENTRADA, ligado/desligado em tempo de
   medido (exigiria apagar o cache do driver).
 - `tools/pipe_warm.py` enche a lista nas combinações de opções (1×, 3×+FXAA, 3×+interpolação, aniso 16).
 - `YW_VK_PIPEKEYS=<arquivo>|0`, `YW_VK_PREWARM=0`. Resumo `[hle] vulkan: compilações síncronas no jogo …`.
+
+## Etiquetas de draw e interpolação por identidade (2026-11-12, fase G1)
+
+**O que foi confirmado no jogo**
+- **Cursor de escrita da lista de comandos do nngx:** é a global `DAT_005c7a28`. Em `FUN_00317030` (o draw), o
+  `FUN_0012fb34` escreve 0x1c palavras com o disparo 0x22F.
+  - Prova: cada faixa [cursor antes, depois) cai dentro do `GxCmd::List` submetido.
+  - Na rota foram 224 635 draws e 0 listas inconsistentes.
+- **O laço de objetos `FUN_00325cf8` só enfileira.** Os draws saem depois, da fila do dispositivo (`FUN_001c9508`), sem
+  o objeto: 37 486 inícios de objeto e 0 draws dentro deles.
+  - Por isso a identidade é o estado do dispositivo no draw: a matriz de modelo do último `FUN_003166d4(ctx, M)`.
+  - Nos cenários (86 %), `M` fica no heap e é estável por nó.
+  - Nos personagens com esqueleto (14 %), `M` está na pilha (nó 0). Eles pareiam por (malha, prim, origem) e pela ordem.
+
+**Desenho**
+- `Etiqueta { obj, malha, prim, sub, origem, ancora }` mais a geração de corte.
+- Caminho da etiqueta: anel no lado do jogo → `extrair(addr,size)` no despacho → `GxCmd::List(.., Option<Arc<EtiqLista>>)`
+  → `pica::execute_words_etiq`.
+- Na thread "gpu", `casar` exige exatamente 1 disparo por faixa. Se não bater, a lista inteira fica sem etiqueta, com
+  aviso único.
+- Os ganchos só são registrados com a captura da interpolação ativa (`hle/etiquetas.rs`). Sem interpolação, não há
+  nenhum gancho.
+
+**Pareamento**
+- `pair` usa a etiqueta e exige o mesmo programa.
+- Draws sem etiqueta seguem pela heurística, só entre si.
+
+**Corte de câmera**
+- O corte vem do envio da câmera em `FUN_00325c18` (view 3×4 em câm+0x44). Há corte quando:
+  - a câmera não aparece nos últimos 4 envios;
+  - o olho salta mais que 12 + 4×ΔVBlanks;
+  - ou a câmera gira mais que 20°.
+- `YW_ETIQ_CORTE=base,vel,graus` ajusta esses limites.
+- Com etiquetas, `usable` corta só pela câmera ou por `complex`.
+
+**Variáveis:** `YW_INTERP_TAGS=0` volta à heurística. `YW_ETIQ_LOG=1|2` dá o diagnóstico; a linha `[interp-etiq]`
+aparece com `YW_INTERP_STATS`.
+
+**Medido** (rota até 205 s, novo jogo, 3×, interpolação a 120):
+
+| | Heurística | Etiquetas |
+|---|---|---|
+| Quadros sem interpolar (de 6 750) | 1 313 | 9 |
+| Rua 147–151 s | 10–13 cortes/s | 0 |
+| Quarto | 4–6 cortes/s | 0 |
+| Voo da abertura | 9–29 cortes/s | 0 |
+
+- Os 8 cortes que restaram são todos trocas de cena reais.
+- CPU do jogo ociosa: igual sem interpolação; cerca de −0,5 ponto com ela.
+
+## Mods (2026-11-12, fase G2)
+Formato, API e limites estão em **docs/MODS.md**.
+- **Gancho de arquivos:** `FUN_0047359c(ger, caminho, &buf, &tam, &achou, heap)` é interceptada. O mod é alocado com
+  `FUN_0030f4e0(heap, (tam+4)&~3, 2)`, o alocador do próprio jogo, chamado de dentro do gancho por `chamar_jogo`, que
+  salva e restaura o `Cpu` e usa o lr sentinela 0xFFFFFFF0.
+- **Mod de código:** DLL com ABI C v1, carregada por `LoadLibraryExW` (`hle/mods/carregador.rs`). Vem desligada por
+  padrão, e o menu pede confirmação para ligá-la.
+- **Testes:**
+  - um `.cfg.bin` de menu trocado aparece na tela de baixo (3 % dos pixels, só na caixa de texto);
+  - o minimapa recolorido também aparece;
+  - o mod de exemplo carrega;
+  - um mod que declara a API v99 é recusado sem pânico.
+- **Gancho de log de investigação:** `YW_HOOK_LOG="0x47359c:antes:s1; 0x317030:depois; …"` (com `sN` e `xN+OFF/LEN`)
+  e `YW_HOOK_LOG_MAX`, em `hooks.rs`. Ele registra ganchos de log em qualquer função sem recompilar.
+
+**Janela: adaptador com Mailbox (2026-11-15).** A superfície Vulkan do wgpu nesta RX 5500 XT oferece só
+[Immediate, Fifo, FifoRelaxed]; a DX12 oferece [Mailbox, Fifo, Immediate]. Quando o wgpu passou a escolher o Vulkan,
+a opção "caixa" caiu em V-Sync: a 180 Hz foram 155–163 imagens/s com ~9 % dos passos pulados, igual com e sem
+etiquetas. Com DX12/Mailbox foram 178–179 imagens/s e 0–1 %. O `wgpu_config` agora põe em primeiro o adaptador cuja
+superfície tem Mailbox.
+
+## Widescreen da tela de cima (2026-11-15, fase G3)
+Opção `graficos.proporcao` = `original` | `16:9` | `16:10` | `21:9` | `janela` (menu Gráficos, vale na hora). `YW_ASPECT`
+vence o arquivo; valores fora do menu (ex. `32:9`) também são aceitos.
+
+**Lado do jogo** (`engine/src/hle/widescreen.rs`, detalhes e provas no cabeçalho):
+- **Projeção:** `FUN_0016efc4` monta uma projeção quadrada. O 5:3 entra em `FUN_0012953c(ctx)`, que multiplica m[0] e
+  m[8] por `*(ctx+0xd90) / *(ctx+0xd8c)` = 240/400 e transpõe com giro (a horizontal da tela é o eixo y do clip do PICA).
+- **Culling:** `FUN_002e11ec(câm, &(400,240), obj)` → `FUN_001aae7c`.
+- **Ganchos:** dois "substituir" trocam 400 por W' = 240·proporção durante a chamada original e devolvem 400 depois.
+  Só valem na perspectiva da tela de cima; a tela de baixo e as ortográficas ficam iguais.
+- `YW_WIDE_CULL=0` desliga só o culling largo (prova A/B).
+
+**Renderizador:** a sombra da tela de cima tem `round(240·N·proporção)` linhas, e o widescreen liga a sombra mesmo a 1×.
+Cada draw recebe uma classe (`Ctx::larga`, `YW_LARGA_LOG=N` para ver):
+- **cena** (c3 de perspectiva): ocupa a largura toda;
+- **2D central:** fica no retângulo 5:3 do meio (a G5 vai ancorar; `larga_ymap` já recebe `ancora`);
+- **2D de tela cheia** (vértices rodados na CPU, até 16): estica. Só conta se cobre toda a horizontal e ≥ 2/3 da
+  vertical, e se há cena no quadro ou o draw não tem textura. Arte de tela cheia em telas só 2D (aviso, título, vídeo)
+  fica centralizada com faixas, para não esticar 40 % a 21:9.
+- FXAA, interpolação e as imagens publicadas seguem a largura nova. `present.comp` ganhou `fw`/`ihn` (igual ao antigo em 5:3).
+
+**Medido:**
+| O quê | Resultado |
+|---|---|
+| 5:3 contra antes | `pica_frame*` 9/9 e `interp_nao_contamina_nativo` com 0 bytes |
+| Escala da cena (correlação, `tools/wide_medir.py`) | 1,0000 em 16:9 (112/112) e 21:9 (56/56); esticada daria 1,0675 / 1,40 |
+| Custo de GPU, 16:9 a 3× | +1,1 % na rua, +3,3 % em 40–95 s (meta ≤ +12 %) |
+| Janela a 120 Hz, 3× | 120 imagens/s, 0 % de passos pulados, em 5:3 e 16:9 |
+| Culling largo | +12,6 % de draws de cena |
+
+**[H] em aberto:** câmeras de perspectiva que não passem por `0x12953c` sairiam comprimidas (só a rota até a rua foi
+validada); as faixas das telas só 2D usam a cor de clear do jogo.
+
+## HUD ancorada no widescreen (2026-11-16, fase G5)
+Com a tela de cima larga (G3), o 2D da HUD sobre a cena pode encostar na borda esquerda/direita da imagem larga, à
+mesma distância que tinha da borda nativa. Ligado por padrão; `YW_HUD_ANCORA=0` (ou `render::set_hud_ancorada(false)`)
+= HUD inteira no 5:3 central, como na G3. Código em `engine/src/hle/hud.rs` (provas no cabeçalho).
+
+**Confirmado no jogo** (rota `route_probe4` a 21:9; `YW_HUD_DIAG`, `YW_HUD_FN`, `YW_HUD_ANCORA_FORCAR`):
+- O y menor do alvo (linhas de memória) é a ESQUERDA da tela: com todo o 2D forçado em −1 as caixas de diálogo foram
+  para a esquerda.
+- O 2D sai do mesmo laço que o 3D: `FUN_0032f4dc` → `FUN_00323c2c(rend, ctx, camada)` percorre os itens da camada e
+  chama o vfunc +0x38 do desenhista de cada um; malhas por `FUN_001bb848` → `FUN_0031e01c`/`FUN_002f89a8` →
+  `FUN_00317030`; texto por `FUN_002f70c0`. `FUN_00322acc` = outra lista; `FUN_00324694` = véu de tela cheia.
+- Um elemento da tela são vários itens que se sobrepõem: retrato do falante, balão do nome, texto, e a caixa do diálogo
+  (desenhada numa textura, 0x1f000000, e posta como um quadro só). O texto do nome usa um cache de glifos desenhado num
+  alvo 400×240 que não é o da tela.
+
+**Como decide:** grupo = hash(pilha de itens dos ganchos em 0x323c2c/0x1bb848/0x322acc, matriz de modelo), levado
+pela etiqueta (`EtiqDraw::grupo`; com a HUD ligada as etiquetas andam também sem interpolação). Na thread "gpu", só
+draws `LARGA_2D` no alvo que o DisplayTransfer da tela de cima lê e com cena 3D no quadro (telas só 2D ficam
+centradas com a arte). No fim do quadro, grupos que se sobrepõem viram um conjunto e a união decide: terço do centro
+(caixa inteira, também fora da tela; larga > 2/3 = centro; 8 px de histerese). O quadro seguinte usa a decisão
+(`Ctx::ancora` → `larga_ymap`; a interpolação reproduz pelo `Ctx`).
+
+**Medido** (`tools/hud_medir.py`, mesma captura em 5:3 e larga; folhas `work/img_png/g5_folha_{53,169,219}.png`):
+- ▼ do aviso do mod (isolado, canto direito): borda direita 12 → 12 px em 21:9 e 16:9 (erro 0).
+- Diálogos com retrato, painel do tutorial, barra Objetivo: conjunto largo → centro, erro 0 (21:9) / 0,5 px (16:9,
+  largura ímpar 427); nada partido (antes da junção por sobreposição o retrato ia para a direita e o balão ficava).
+- Interpolação a 120 com `YW_INTERP_VALIDATE` em 21:9: fidelidade α=1 0,000 em todas as janelas.
+- 5:3: `pica_frame*` e `interp_nao_contamina_nativo` com 0 bytes (nada muda sem widescreen).
+
+**[H]/limites:** elemento novo decide pela própria caixa no 1º quadro em que aparece (o conjunto vale a partir do 2º);
+a rota não chega à rua livre, batalha nem menu de campo: o banner de área e a HUD de batalha não foram vistos. A
+tabela de exceções `data/hud_ancoras.toml` não foi feita (os nomes de layout/nó não chegam ao draw).
+
+## Turbo e ferramentas de desenvolvedor (2026-11-16, fase G6)
+**Turbo** (`engine/src/hle/turbo.rs`): segurar Tab (teclado) ou o clique do analógico direito (controle) multiplica a
+taxa de VBlank por `emulacao.turbo` (2–4×, padrão 3×). Os dois botões são remapeáveis como "Turbo (segurar)".
+- **VBlank:** o laço de VBlank troca a taxa ao vivo e rebaseia o prazo absoluto a partir do último VBlank. O tempo do
+  jogo (VBLANKS/hz) não muda, então roteiros e capturas caem no mesmo ponto. O vigia conta segundos de verdade
+  (`relogio_vblank_s`), então escala sozinho.
+- **Som mudo:** o DSP entrega quadros em silêncio do mesmo tamanho, sem mexer na geração nem na contrapressão da fila.
+  O relógio do DSP fica em 1×: o que espera um som acabar não acelera.
+- **Durante o turbo:** a interpolação pausa e, na janela, a resolução interna cai para a nativa e o FXAA desliga
+  (com 6× + FXAA o turbo não passava de ~31 quadros/s). `YW_TURBO_HIRES=1` mantém a resolução.
+- **Soltar o turbo:** acontece também ao abrir o menu, ao tirar o foco da janela ou quando o jogo para. Um
+  indicador "▶▶ 3×" fica no canto.
+- **Opções:** `YW_TURBO=0` desliga; `YW_TURBO=2..4` fixa o multiplicador. No roteiro, `70:turbo/45` ou `a+turbo`;
+  `soak.py --turbo "INÍCIO/DURAÇÃO …"`.
+- **Atenção:** o Tab deixou de ser Select por padrão (Select = Shift direito). Um settings com `select = ["Tab", …]`
+  perde o Tab ao carregar.
+
+**Medido:**
+| O quê | Resultado |
+|---|---|
+| Turbo 3× sem janela | 88,8–90,6 quadros/s |
+| 3 jogos em paralelo | 67–90 |
+| Ao soltar | 1º VBlank normal em 16,4–16,9 ms; a troca aplica em 1,6–4 ms |
+| Sem turbo | 29,92 quadros/s; CPU ociosa 88,8 % (igual a antes) |
+| `soak.py --runs 9 --parallel 3 --turbo "40/20 90/25 140/20"` | 0 travamentos (G5 + G6 integradas) |
+| Janela, 6× + FXAA, 120 Hz | 89,5 quadros/s no turbo |
+
+**Ferramentas** (`engine/src/hle/dev.rs`; `dev.ferramentas` ou `YW_DEV=1`, desligadas por padrão): F3 abre janelas
+egui sem pausar o jogo.
+- **Ganchos:** resumo e contadores.
+- **Memória:** hex de 256 bytes e valores vigiados (`dev.vigiados = ["0xEND:tipo"]`).
+- **Arquivos abertos:** ganchos só de leitura em 0x47359c/0x47365c/0x473728, compatíveis com os mods.
+- **Câmera:** gancho só de leitura em `FUN_00325c18` e os cortes das etiquetas.
+- **Desempenho:** draws, pipelines, VRAM.
+- **Fora:** a lista por draw e as miniaturas de textura ainda não existem. O F3 não foi aberto numa janela real (só
+  os ganchos foram conferidos pelo log).

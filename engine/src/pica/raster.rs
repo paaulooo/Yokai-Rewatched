@@ -105,6 +105,12 @@ pub struct Ctx {
     pub blend_fac: [u32; 4],
     pub blend_color: [u8; 4],
     pub logic_op: u32,
+    /// widescreen da tela de cima (G3): classe do draw (`render::LARGA_*`), decidida em `pica::draw`; 0 = não se aplica
+    pub larga: u8,
+    /// HUD ancorada (G5): onde um draw `LARGA_2D` fica na largura nova, de −1 (borda de y menor do alvo) a +1; 0 =
+    /// centro (como na G3). Decidida em `pica::draw` pelo grupo do draw (`hle/hud.rs`); a interpolação a reproduz (o
+    /// `Ctx` vai na captura)
+    pub ancora: f32,
 }
 
 /// Recorta contra os planos do PICA (Citra `clipper.cpp`): −w ≤ x,y ≤ w, −w ≤ z ≤ 0, w ≥ ε.

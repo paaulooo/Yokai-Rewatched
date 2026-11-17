@@ -1,0 +1,16 @@
+[package]
+name = "registro_arquivos"
+version = "0.1.0"
+edition = "2021"
+description = "Mod de exemplo do yw1r: registra no log os arquivos que o jogo abre (não muda nada)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+yw1-modapi = { path = "../../modapi" }
+
+# crate fora de qualquer workspace do projeto
+[workspace]

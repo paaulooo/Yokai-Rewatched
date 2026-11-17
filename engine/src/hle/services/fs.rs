@@ -12,15 +12,17 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use super::romfs::{self, Camadas};
 
 const ERR_NOT_FOUND: u32 = 0xc880_4478;
 const ERR_NOT_FORMATTED: u32 = 0xc8a0_4554;
 const ERR_EXT_NOT_FOUND: u32 = 0xc8a0_4478;
 
 enum Node {
-    /// imagem RomFS: arquivo do host + deslocamento do nível 3 + tamanho
-    Rom { file: File, base: u64, size: u64 },
+    /// imagem RomFS: arquivo do host + deslocamento do nível 3 + tamanho (+ camadas dos mods LayeredFS, `romfs.rs`)
+    Rom { file: File, base: u64, size: u64, lay: Option<Arc<Camadas>> },
     Host { file: File },
     Dir,
 }
@@ -45,11 +47,33 @@ fn with<R>(f: impl FnOnce(&mut Fs) -> R) -> R {
 }
 
 /// Caminho do jogo (`.3ds`): `YW_GAME` ou `BASE/Yo-Kai Watch (USA).3ds`.
-fn game_file() -> PathBuf {
+pub(crate) fn game_file() -> PathBuf {
     if let Some(p) = std::env::var_os("YW_GAME") {
         return PathBuf::from(p);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Yo-Kai Watch (USA).3ds")
+}
+
+/// RomFS virtual dos mods LayeredFS (`mods::iniciar` → [`preparar_camadas`], antes do jogo abrir a RomFS).
+static CAMADAS: OnceLock<Arc<Camadas>> = OnceLock::new();
+
+/// Arquivos da RomFS do `.3ds` (para separar, nos mods, o que troca um arquivo inteiro da RomFS do que troca um arquivo
+/// de dentro do `.fa`).
+pub fn listar_romfs() -> std::io::Result<Vec<romfs::Entrada>> {
+    let mut f = File::open(game_file())?;
+    let (base, _) = romfs_level3(&mut f)?;
+    romfs::listar(&mut f, base)
+}
+
+/// Monta a RomFS virtual com os arquivos inteiros trocados pelos mods: (caminho normalizado, arquivo no PC).
+/// Devolve (caminho, tamanho original, tamanho novo) de cada um. Só vale uma vez (no boot).
+pub fn preparar_camadas(trocas: &[(String, PathBuf)]) -> Result<Vec<(String, u64, u64)>, String> {
+    let path = game_file();
+    let mut f = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (base, size) = romfs_level3(&mut f).map_err(|e| e.to_string())?;
+    let m = romfs::montar(&mut f, base, size, trocas).map_err(|e| e.to_string())?;
+    CAMADAS.set(Arc::new(m.camadas)).map_err(|_| "RomFS virtual já montada".to_string())?;
+    Ok(m.trocados)
 }
 
 /// Localiza o nível 3 do RomFS dentro do `.3ds`: (deslocamento, tamanho).
@@ -137,8 +161,17 @@ fn open_rom(fs: &mut Fs) -> Result<u32, u32> {
         eprintln!("[fs] RomFS de {}: {e}", path.display());
         ERR_NOT_FOUND
     })?;
-    eprintln!("[fs] RomFS: {} @ {base:#x} ({size} bytes)", path.display());
-    Ok(new_session(fs, Node::Rom { file, base, size }, "file"))
+    let lay = CAMADAS.get().cloned();
+    match &lay {
+        Some(c) => eprintln!(
+            "[fs] RomFS: {} @ {base:#x} ({size} bytes) + mods LayeredFS → {} bytes virtuais",
+            path.display(),
+            c.tamanho()
+        ),
+        None => eprintln!("[fs] RomFS: {} @ {base:#x} ({size} bytes)", path.display()),
+    }
+    let size = lay.as_ref().map_or(size, |c| c.tamanho());
+    Ok(new_session(fs, Node::Rom { file, base, size, lay }, "file"))
 }
 
 fn open_host(fs: &mut Fs, dir: PathBuf, path: &str, flags: u32) -> Result<u32, u32> {
@@ -333,7 +366,8 @@ fn node_request(ipc: &Ipc, id: u32, dir: bool) {
             let n = with(|fs| {
                 let mut buf = vec![0u8; size as usize];
                 let n = match fs.nodes.get_mut(&id) {
-                    Some(Node::Rom { file, base, size: total }) => {
+                    Some(Node::Rom { file, base, lay: Some(c), .. }) => c.ler(file, *base, off, &mut buf),
+                    Some(Node::Rom { file, base, size: total, lay: None }) => {
                         let len = (size as u64).min(total.saturating_sub(off)) as usize;
                         file.seek(SeekFrom::Start(*base + off)).and_then(|_| file.read_exact(&mut buf[..len])).map(|_| len).unwrap_or(0)
                     }
@@ -395,7 +429,9 @@ fn node_request(ipc: &Ipc, id: u32, dir: bool) {
         0x080c => {
             let r = with(|fs| {
                 let n = match fs.nodes.get(&id) {
-                    Some(Node::Rom { file, base, size }) => file.try_clone().ok().map(|f| Node::Rom { file: f, base: *base, size: *size }),
+                    Some(Node::Rom { file, base, size, lay }) => {
+                        file.try_clone().ok().map(|f| Node::Rom { file: f, base: *base, size: *size, lay: lay.clone() })
+                    }
                     Some(Node::Host { file }) => file.try_clone().ok().map(|f| Node::Host { file: f }),
                     _ => None,
                 };

@@ -6,8 +6,10 @@
 //! (`present::touch_point`). Menu: Esc/F1, ou Start + Select juntos no controle (Guide quando o backend o envia).
 //! F11 = tela cheia. Com o menu aberto o console fica pausado (`hle::set_paused`, pausa parcial: ver hle/mod.rs) e o
 //! jogo não recebe entrada.
-//! Configurações em `%APPDATA%/yw1/settings.toml` (`settings.rs`); `YW_RENDERER`, `YW_SCALE`, `YW_PAD_LAYOUT` e
-//! `YW_VOLUME` continuam valendo por cima do arquivo. `WGPU_BACKEND=dx12` força o DX12 na apresentação.
+//! Configurações em `%APPDATA%/yw1/settings.toml` (`settings.rs`); `YW_RENDERER`, `YW_SCALE`, `YW_PAD_LAYOUT`,
+//! `YW_VOLUME` e `YW_ASPECT` continuam valendo por cima do arquivo. `WGPU_BACKEND=dx12` força o DX12 na apresentação.
+//! Widescreen (G3, `graficos.proporcao`): a tela de cima ocupa 240·proporção pixels do 3DS em todos os layouts
+//! (`present::place_w`); "seguir a janela" recalcula a proporção a cada redesenho (`present::aspect_para_janela`).
 
 use super::input::{self, Sample};
 use super::menu::{self, Acao, Menu};
@@ -15,7 +17,7 @@ use super::fsr;
 use super::present;
 use super::services::dsp::output as audio;
 use super::services::hid::{BUTTONS, STICK, TOUCH};
-use super::settings::{self, Apresentacao, EnvOverrides, Filtro, LimiteFps, Renderizador, Settings};
+use super::settings::{self, Apresentacao, EnvOverrides, Filtro, LimiteFps, Proporcao, Renderizador, Settings};
 use super::{crash_message, gpu};
 use crate::render::vulkan::{Group, HiRes};
 use egui_wgpu::winit::Painter;
@@ -70,7 +72,46 @@ impl Config {
             crate::render::set_async(current.graficos.renderizacao == settings::Renderizacao::Assincrona);
         }
         super::set_stereo_from_settings(current.graficos.estereo_3d);
+        aplicar_proporcao(&env, current.graficos.proporcao, None);
+        aplicar_hud_ancorada(current.graficos.hud_ancorada);
+        // turbo (multiplicador) e ferramentas de desenvolvedor (o boot instala os ganchos delas)
+        super::turbo::set_mult(current.emulacao.turbo);
+        if super::dev::ligado(&current) {
+            super::dev::PEDIDO.store(true, Ordering::SeqCst);
+        }
         Config { file, env, current }
+    }
+}
+
+/// Widescreen (G3): passa ao renderizador a proporção escolhida. `janela` = a proporção da área da tela de cima
+/// (`present::aspect_para_janela`; `None` antes de a janela existir = original). Um `YW_ASPECT` sem entrada no menu
+/// (`32:9`, `1.9`…) manda: o renderizador já o leu e nada aqui o sobrescreve.
+/// HUD ancorada (G5): a opção do menu, a menos que `YW_HUD_ANCORA` esteja definido (aí o ambiente manda).
+fn aplicar_hud_ancorada(on: bool) {
+    if std::env::var_os("YW_HUD_ANCORA").is_none() {
+        crate::render::set_hud_ancorada(on);
+    }
+}
+
+fn aplicar_proporcao(env: &EnvOverrides, p: Proporcao, janela: Option<f32>) {
+    if env.proporcao.is_none() && std::env::var_os("YW_ASPECT").is_some() {
+        return;
+    }
+    let a = p.valor().or(janela).unwrap_or(crate::render::ASPECTO_ORIGINAL);
+    let antes = crate::render::aspect();
+    crate::render::set_aspect(a);
+    let agora = crate::render::aspect();
+    if agora != antes && p != Proporcao::Janela {
+        eprintln!("[janela] proporção da tela de cima: {} ({agora:.3})", p.nome());
+    }
+}
+
+/// Largura da tela de cima em pixels do 3DS: 400, ou 240·proporção com o widescreen em efeito.
+fn top_w() -> f32 {
+    if crate::render::wide_active() {
+        240.0 * crate::render::aspect()
+    } else {
+        present::TOP.0
     }
 }
 
@@ -236,6 +277,10 @@ struct App {
     gil: Option<gilrs::Gilrs>,
     /// Start + Select do controle seguros juntos (atalho do menu): só dispara de novo depois de soltar
     combo_pad: bool,
+    /// botão do turbo segurado em algum controle (lido em `poll_pads`)
+    turbo_pad: bool,
+    /// ferramentas de desenvolvedor (F3; `dev.ferramentas` / `YW_DEV`)
+    dev: super::dev::Dev,
     menu: Menu,
     info: menu::Info,
     fps: (Instant, u64, f32),
@@ -281,6 +326,8 @@ pub fn run(cfg: Config) {
         mouse_down: false,
         gil: gilrs::Gilrs::new().map_err(|e| eprintln!("[janela] controles indisponíveis: {e}")).ok(),
         combo_pad: false,
+        turbo_pad: false,
+        dev: super::dev::Dev::default(),
         menu: Menu::default(),
         info: menu::Info { renderer_do_ambiente, ..menu::Info::default() },
         fps: (Instant::now(), 0, 0.0),
@@ -299,13 +346,18 @@ pub fn run(cfg: Config) {
     app.save();
 }
 
-/// Configuração do wgpu: Vulkan de preferência, DX12 de reserva (ou o que `WGPU_BACKEND` pedir).
+/// Configuração do wgpu: o adaptador cuja superfície oferece **Mailbox** primeiro; depois Vulkan, DX12 de reserva (ou o
+/// que `WGPU_BACKEND` pedir). Medido (2026-11-15, RX 5500 XT): a superfície Vulkan do wgpu só oferece
+/// [Immediate, Fifo, FifoRelaxed] e a DX12 oferece [Mailbox, Fifo, Immediate]; sem Mailbox a opção "caixa" cai em V-Sync e a
+/// interpolação a 180 Hz perde ~9 % dos passos (155–163 imagens/s) contra 0–1 % (163–178) com Mailbox na DX12.
 fn wgpu_config(display: OwnedDisplayHandle) -> egui_wgpu::WgpuConfiguration {
     let mut setup = egui_wgpu::WgpuSetupCreateNew::from_display_handle(display);
     setup.instance_descriptor.backends =
         wgpu::Backends::from_env().unwrap_or(wgpu::Backends::VULKAN | wgpu::Backends::DX12);
     setup.native_adapter_selector = Some(Arc::new(|adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
         let rank = |a: &wgpu::Adapter| {
+            let sem_mailbox = surface
+                .is_some_and(|s| !s.get_capabilities(a).present_modes.contains(&wgpu::PresentMode::Mailbox));
             let i = a.get_info();
             let b = match i.backend {
                 wgpu::Backend::Vulkan => 0,
@@ -319,7 +371,7 @@ fn wgpu_config(display: OwnedDisplayHandle) -> egui_wgpu::WgpuConfiguration {
                 wgpu::DeviceType::Cpu => 4,
                 wgpu::DeviceType::Other => 3,
             };
-            (b, t)
+            (sem_mailbox, b, t)
         };
         adapters
             .iter()
@@ -401,15 +453,18 @@ impl App {
         if std::env::var_os("YW_INTERP").is_some() || self.interp_aplicada == Some(efetivo) {
             return;
         }
-        crate::render::set_interp(efetivo);
+        // com o turbo segurado a interpolação está pausada: o pedido fica guardado para quando ele for solto
+        super::turbo::pedir_interp(efetivo);
         self.interp_aplicada = Some(efetivo);
         eprintln!("[janela] interpolação: {efetivo} Hz (escolhida {sel}, monitor {})", monitor.map_or("?".into(), |m| format!("{m} Hz")));
     }
 
     fn window_size(&self) -> PhysicalSize<u32> {
         let g = &self.cfg.current.graficos;
-        let (w, h) = present::base_size(g.layout);
-        PhysicalSize::new(w * g.escala_janela, h * g.escala_janela)
+        // a proporção "janela" segue o tamanho: a janela nasce com a tela de cima original
+        let tw = if g.proporcao == Proporcao::Janela { present::TOP.0 } else { 240.0 * g.proporcao.valor().unwrap_or(5.0 / 3.0) };
+        let (w, h) = present::base_size_w(g.layout, tw);
+        PhysicalSize::new((w * g.escala_janela as f32).round() as u32, (h * g.escala_janela as f32).round() as u32)
     }
 
     fn create(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
@@ -465,16 +520,28 @@ impl App {
     fn entrada(&mut self) {
         let Some(size) = self.gfx.as_ref().map(|g| g.win.inner_size()) else { return };
         let g = &self.cfg.current.graficos;
-        let (_, bottom) = present::place(g.layout, size.width as f32, size.height as f32, g.escala_inteira);
+        let (_, bottom) = present::place_w(g.layout, top_w(), size.width as f32, size.height as f32, g.escala_inteira);
         let playing = !self.menu.open && self.crash.is_none();
-        let mut sample = if playing { input::from_keys(&self.held, &self.cfg.current.teclado) } else { Sample::default() };
+        // ferramentas de desenvolvedor abertas: um campo de texto com foco fica com o teclado, e o mouse sobre uma
+        // janela delas não vira toque
+        let teclado_livre = !(self.dev.aberto && self.ctx.egui_wants_keyboard_input());
+        let mut sample = if playing && teclado_livre {
+            input::from_keys(&self.held, &self.cfg.current.teclado)
+        } else {
+            Sample::default()
+        };
         self.poll_pads(playing.then_some(&mut sample));
         let playing = !self.menu.open && self.crash.is_none();
+        let sobre_dev = self.dev.aberto && self.ctx.is_pointer_over_egui();
         if !playing {
             sample = Sample::default();
-        } else if self.mouse_down {
+        } else if self.mouse_down && !sobre_dev {
             sample.touch = self.cursor.and_then(|(x, y)| present::touch_point(bottom, x, y));
         }
+        // turbo: só enquanto segurado e jogando (menu aberto, parada ou janela sem foco soltam)
+        let turbo = playing
+            && ((teclado_livre && input::turbo_keys(&self.held, &self.cfg.current.teclado)) || self.turbo_pad);
+        super::turbo::segurar(super::turbo::JANELA, turbo);
         let (b, stick, touch) = input::encode(&sample);
         // roteiro de entrada ativo (`window_run.py --input`): ele manda nos botões e no toque
         if super::script::ACTIVE.load(Ordering::Relaxed) {
@@ -505,6 +572,7 @@ impl App {
         }
         let c = &self.cfg.current.controle;
         let combo = g.gamepads().any(|(_, p)| p.is_pressed(c.start) && p.is_pressed(c.select));
+        self.turbo_pad = c.turbo != gilrs::Button::Unknown && g.gamepads().any(|(_, p)| p.is_pressed(c.turbo));
         if let Some(s) = s {
             for (_, pad) in g.gamepads() {
                 let axes = (pad.value(gilrs::Axis::LeftStickX), pad.value(gilrs::Axis::LeftStickY));
@@ -669,7 +737,16 @@ impl App {
         };
         let before = self.cfg.current.clone();
         let g = self.cfg.current.graficos.clone();
-        let (top, bottom) = present::place(g.layout, size.width as f32, size.height as f32, g.escala_inteira);
+        // widescreen "seguir a janela": a proporção da área da tela de cima no layout (recalculada a cada redesenho)
+        if g.proporcao == Proporcao::Janela {
+            let a = present::aspect_para_janela(g.layout, size.width as f32, size.height as f32);
+            aplicar_proporcao(&self.cfg.env, g.proporcao, a);
+        }
+        self.info.wide = crate::render::wide_active().then(|| {
+            let n = crate::render::scale();
+            (crate::render::wide_px(n), 240 * n)
+        });
+        let (top, bottom) = present::place_w(g.layout, top_w(), size.width as f32, size.height as f32, g.escala_inteira);
 
         // entrada do jogo (nada com o menu aberto ou depois de parar); também lida a cada acordada do laço
         self.entrada();
@@ -740,8 +817,8 @@ impl App {
         let raw = gfx.egui.take_egui_input(&gfx.win);
         let mut acao = Acao::Nada;
         let mut sair_crash = false;
-        let (menu, cfg, info, tex, crash, fps) =
-            (&mut self.menu, &mut self.cfg, &self.info, &self.tex, &self.crash, self.fps.2);
+        let (menu, cfg, info, tex, crash, fps, dev) =
+            (&mut self.menu, &mut self.cfg, &self.info, &self.tex, &self.crash, self.fps.2, &mut self.dev);
         let gpu_img = self.gpu_img.clone();
         let fsr_format = gfx.painter.render_state().map(|rs| rs.target_format);
         // nitidez 0-100 % -> fator do RCAS 2^(-paradas): 100 % = 1,0 (maxima), 0 % = 0,25
@@ -782,6 +859,12 @@ impl App {
             if cfg.current.graficos.mostrar_fps && crash.is_none() {
                 menu::fps_overlay(ctx, fps);
             }
+            if super::turbo::ativo() && crash.is_none() {
+                super::dev::turbo_overlay(ctx, super::turbo::mult());
+            }
+            if crash.is_none() && !menu.open {
+                dev.ui(ctx, &mut cfg.current);
+            }
         });
         gfx.egui.handle_platform_output(&gfx.win, out.platform_output);
         let prims = self.ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -813,14 +896,24 @@ impl App {
         if cur.graficos.tela_cheia != cheia {
             gfx.win.set_fullscreen(cur.graficos.tela_cheia.then_some(Fullscreen::Borderless(None)));
         }
-        if (cur.graficos.layout != before.graficos.layout || cur.graficos.escala_janela != before.graficos.escala_janela)
+        // proporção da tela de cima (widescreen): vale na hora
+        if cur.graficos.proporcao != before.graficos.proporcao && cur.graficos.proporcao != Proporcao::Janela {
+            aplicar_proporcao(&self.cfg.env, cur.graficos.proporcao, None);
+        }
+        if cur.graficos.hud_ancorada != before.graficos.hud_ancorada {
+            aplicar_hud_ancorada(cur.graficos.hud_ancorada);
+        }
+        let mudou_prop = cur.graficos.proporcao != before.graficos.proporcao && cur.graficos.proporcao != Proporcao::Janela;
+        if (cur.graficos.layout != before.graficos.layout || cur.graficos.escala_janela != before.graficos.escala_janela || mudou_prop)
             && !gfx.win.is_maximized()
             && !cheia
             && !cur.graficos.tela_cheia
         {
-            let (w, h) = present::base_size(cur.graficos.layout);
-            let k = cur.graficos.escala_janela;
-            let _ = gfx.win.request_inner_size(PhysicalSize::new(w * k, h * k));
+            // no "seguir a janela" o tamanho fica: a proporção é que se adapta a ele
+            let tw = if cur.graficos.proporcao == Proporcao::Janela { top_w() } else { 240.0 * cur.graficos.proporcao.valor().unwrap_or(5.0 / 3.0) };
+            let (w, h) = present::base_size_w(cur.graficos.layout, tw);
+            let k = cur.graficos.escala_janela as f32;
+            let _ = gfx.win.request_inner_size(PhysicalSize::new((w * k).round() as u32, (h * k).round() as u32));
         }
         self.aplicar_apresentacao();
         let cur = &self.cfg.current;
@@ -836,6 +929,13 @@ impl App {
         if cur.som != before.som {
             audio::set_volume(cur.som.volume);
             audio::set_muted(cur.som.mudo);
+        }
+        if cur.emulacao.turbo != before.emulacao.turbo {
+            super::turbo::set_mult(cur.emulacao.turbo);
+        }
+        // ferramentas ligadas no menu: ganchos instalados na hora (ficam até sair)
+        if cur.dev != before.dev && super::dev::ligado(cur) {
+            super::dev::instalar();
         }
         if self.cfg.current.graficos.interpolacao != before.graficos.interpolacao {
             self.aplicar_interp();
@@ -890,6 +990,10 @@ impl ApplicationHandler for App {
                     if !event.repeat {
                         if matches!(code, KeyCode::Escape | KeyCode::F1) {
                             self.toggle_menu();
+                        }
+                        if code == KeyCode::F3 && super::dev::ligado(&self.cfg.current) && !self.menu.open {
+                            super::dev::instalar();
+                            self.dev.toggle();
                         }
                         if code == KeyCode::F11 {
                             let g = &mut self.cfg.current.graficos;

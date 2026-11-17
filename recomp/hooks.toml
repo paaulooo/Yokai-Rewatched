@@ -20,4 +20,16 @@
 #   nome = "nome_curto"
 #   motivo = "por que este ponto precisa de gancho (o que o callback lê/muda)"
 #
-# (vazio por enquanto: os ganchos reais vêm nas próximas fases — etiquetas de draw, mods, widescreen)
+
+# (vazio por enquanto.) G1 (etiquetas de draw, engine/src/hle/etiquetas.rs) testou ganchos no laço de objetos
+# FUN_00325cf8 (`blx ip` 0x325d90 / passo 0x325d94): o laço só ENFILEIRA — 37 mil objetos com 0 draws dentro — e os
+# draws saem depois da fila de comandos do dispositivo; as etiquetas usam só ganchos de entrada (FUN_003166d4,
+# FUN_001c9648, FUN_00317030, FUN_00325c18), que não precisam de nada aqui.
+
+# G1: FUN_001c9648(ctx, M) = matriz de modelo ← modelo atual × M (personagens com esqueleto; o resultado vai para a
+# pilha antes de FUN_003166d4). Não é entrada de função recompilada (fica numa região densa, função 0x2e9ed8): o
+# gancho em instrução lê o M (r1), que identifica o nó quando não está na pilha.
+[[at]]
+va = 0x1c9648
+nome = "etiq_mult"
+motivo = "r1 = matriz M de modelo × M (nó do personagem com esqueleto) para a etiqueta do draw seguinte"

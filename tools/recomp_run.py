@@ -1,6 +1,9 @@
 """Roda o jogo recompilado sem janela com um roteiro de entrada e monta a folha de contato das telas.
 
-    python recomp_run.py NOME --secs 100 [--input "20:start; +8:a"] [--every 1] [--step 3] [--speed 3]
+    python recomp_run.py NOME --secs 100 [--input "20:start; +8:a"] [--every 1] [--step 3] [--speed 3] [--exe CAMINHO]
+
+--exe roda outro executável (ex.: o de um CARGO_TARGET_DIR próprio, work/target-g1/release/yw1r.exe); a pasta de
+trabalho continua work/recomp.
 
 --secs e os tempos do roteiro são do relógio do console; --speed acelera o console inteiro (só testes; padrão 1).
 
@@ -29,6 +32,7 @@ def main():
     ap.add_argument("--renderer", default="vulkan")
     ap.add_argument("--tail", type=int, default=30)
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--exe", default=str(EXE), help="executável (padrão: work/recomp/target/release/yw1r.exe)")
     a = ap.parse_args()
     out = WORK / "runs" / a.name
     out.mkdir(parents=True, exist_ok=True)
@@ -50,7 +54,7 @@ def main():
         env["YW_INPUT"] = a.input
     log = WORK / "runs" / f"{a.name}.log"
     with open(log, "w", encoding="utf8", errors="replace") as f:
-        r = subprocess.run([str(EXE)], cwd=EXE.parent.parent.parent, env=env, stdout=f, stderr=subprocess.STDOUT,
+        r = subprocess.run([a.exe], cwd=EXE.parent.parent.parent, env=env, stdout=f, stderr=subprocess.STDOUT,
                            timeout=a.secs / a.speed + 90)
     lines = log.read_text(encoding="utf8", errors="replace").splitlines()
     keep = [l for l in lines if not l.startswith(NOISE) and not l.startswith("  t")]

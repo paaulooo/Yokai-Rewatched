@@ -44,6 +44,11 @@ pub fn from_keys(held: &HashSet<KeyCode>, keys: &Teclado) -> Sample {
     s
 }
 
+/// A tecla do turbo (`teclado.turbo`) está segurada?
+pub fn turbo_keys(held: &HashSet<KeyCode>, keys: &Teclado) -> bool {
+    keys.get(Botao::Turbo).iter().any(|k| held.contains(k))
+}
+
 /// Soma um controle: `pressed(botão)` diz se está apertado; `axes` = analógico esquerdo (−1…1, y para cima).
 pub fn add_pad(s: &mut Sample, pad: &Controle, pressed: impl Fn(gilrs::Button) -> bool, axes: (f32, f32)) {
     for b in Botao::PAD {
@@ -175,7 +180,6 @@ mod tests {
             (KeyCode::KeyK, 1 << 0),
             (KeyCode::KeyX, 1 << 1),
             (KeyCode::Backspace, 1 << 1),
-            (KeyCode::Tab, 1 << 2),
             (KeyCode::ShiftRight, 1 << 2),
             (KeyCode::Enter, 1 << 3),
             (KeyCode::ArrowRight, 1 << 4),
@@ -193,6 +197,10 @@ mod tests {
             assert_eq!(s.stick, (0.0, 0.0));
         }
         assert_eq!(from_keys(&held(&[KeyCode::Escape, KeyCode::F1]), &t), Sample::default());
+        // Tab = turbo (G6): não vira botão do 3DS
+        assert_eq!(from_keys(&held(&[KeyCode::Tab]), &t), Sample::default());
+        assert!(turbo_keys(&held(&[KeyCode::Tab]), &t));
+        assert!(!turbo_keys(&held(&[KeyCode::ShiftRight]), &t));
     }
 
     #[test]

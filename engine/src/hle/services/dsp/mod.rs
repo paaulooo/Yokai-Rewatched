@@ -303,6 +303,8 @@ struct Stats {
     max_playing: usize,
     playing_mask: u32,
     peak: i32,
+    /// quadros entregues em silêncio porque o turbo estava ligado (total)
+    mudos: u64,
     last_print: Option<std::time::Instant>,
 }
 
@@ -594,6 +596,15 @@ pub fn audio_frame() {
                 }
             }
             st.max_playing = st.max_playing.max(n);
+            // turbo (`hle::turbo`): o quadro foi gerado e publicado como sempre (a contrapressão e o consumo dos
+            // buffers do jogo não mudam), só a SAÍDA vai em silêncio, do mesmo tamanho — a fila do dispositivo
+            // continua no nível de sempre (nem cresce nem falta amostra)
+            let f = if crate::hle::turbo::ativo() {
+                st.mudos += 1;
+                [[0i16; 2]; SAMPLES_PER_FRAME]
+            } else {
+                f
+            };
             for s in &f {
                 st.peak = st.peak.max((s[0] as i32).abs()).max((s[1] as i32).abs());
             }
@@ -696,8 +707,17 @@ fn print_stats() {
     };
     let current: usize = d.core.sources.iter().filter(|s| s.playing()).count();
     eprintln!(
-        "[dsp] {:?} · quadros {} (segurados esperando o jogo: {}) · fontes tocando {} (máx {} no último s, ids {}) · pico {} ({:.1} dBFS) · {}",
-        d.power, st.frames, st.held, current, st.max_playing, ids.join(" "), st.peak, db, out
+        "[dsp] {:?} · quadros {} (segurados esperando o jogo: {}) · fontes tocando {} (máx {} no último s, ids {}) · pico {} ({:.1} dBFS) · {}{}",
+        d.power,
+        st.frames,
+        st.held,
+        current,
+        st.max_playing,
+        ids.join(" "),
+        st.peak,
+        db,
+        out,
+        if st.mudos > 0 { format!(" · mudos pelo turbo {}", st.mudos) } else { String::new() }
     );
     st.last_print = Some(now);
     st.max_playing = 0;

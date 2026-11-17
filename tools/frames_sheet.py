@@ -27,15 +27,25 @@ def load(dir_: Path):
 
 
 def screen(p: Path | None, w: int, h: int) -> Image.Image:
+    """Tela gravada no tamanho do 3DS (altura `h`): imagens da resolução interna N× e do widescreen (largura
+    240·proporção) vêm com o tamanho no nome e são reduzidas para a altura `h`, mantendo a proporção."""
     if p is None:
         return Image.new("RGB", (w, h), (40, 0, 40))
-    return Image.frombytes("RGBA", (w, h), p.read_bytes()).convert("RGB")
+    m = NAME.search(p.name)
+    rw, rh = (int(m[3]), int(m[4])) if m else (w, h)
+    im = Image.frombytes("RGBA", (rw, rh), p.read_bytes()).convert("RGB")
+    if rh != h:
+        im = im.resize((max(1, round(rw * h / rh)), h), Image.LANCZOS)
+    return im
 
 
 def stacked(s: dict[int, Path]) -> Image.Image:
-    im = Image.new("RGB", (400, 480), (0, 0, 0))
-    im.paste(screen(s.get(0), 400, 240), (0, 0))
-    im.paste(screen(s.get(1), 320, 240), (40, 240))
+    top = screen(s.get(0), 400, 240)
+    bot = screen(s.get(1), 320, 240)
+    w = max(top.width, 400)
+    im = Image.new("RGB", (w, 480), (0, 0, 0))
+    im.paste(top, ((w - top.width) // 2, 0))
+    im.paste(bot, ((w - bot.width) // 2, 240))
     return im
 
 
@@ -74,7 +84,9 @@ def main():
     d = ImageDraw.Draw(sheet)
     for i, t in enumerate(picked):
         x, y = (i % a.cols) * tw, (i // a.cols) * (th + 14)
-        sheet.paste(stacked(shots[t]).resize((tw, th), Image.BILINEAR), (x, y + 14))
+        st = stacked(shots[t])
+        # widescreen: a folha mantém a célula de 400 de largura (a imagem larga é reduzida para caber)
+        sheet.paste(st.resize((tw, round(th * 400 / st.width)), Image.BILINEAR), (x, y + 14 + (th - round(th * 400 / st.width)) // 2))
         d.text((x + 3, y + 1), f"{t / 10:.1f}s", fill=(255, 255, 0))
     out = a.o or WORK / "img_png" / f"sheet_{picked[0]:05d}_{picked[-1]:05d}.png"
     out.parent.mkdir(parents=True, exist_ok=True)

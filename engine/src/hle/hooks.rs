@@ -419,6 +419,105 @@ pub fn log_resumo() {
     }
 }
 
+/// Ganchos de LOG pedidos por variável, para investigar funções do jogo sem mexer no código:
+/// `YW_HOOK_LOG="0x317030:depois; 0x47359c:antes:s1; 0x325cf8:antes:x0+0x88/16; 0x3a0b4:em"`.
+/// Campos depois do endereço: `antes` (padrão) | `depois` (mostra também a entrada) | `em` (instrução do hooks.toml);
+/// `sN` = texto C em rN; `xN+OFF/LEN` = LEN bytes (≤ 64) em rN+OFF. Uma linha `[gancho-log]` por chamada, até
+/// `YW_HOOK_LOG_MAX` por gancho (padrão 300), com o VBlank atual (`q`) para alinhar com outros logs.
+pub fn registrar_log_env() {
+    let Ok(spec) = std::env::var("YW_HOOK_LOG") else { return };
+    let max: u64 = std::env::var("YW_HOOK_LOG_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    for item in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut campos = item.split(':').map(str::trim);
+        let va_txt = campos.next().unwrap_or("");
+        let Ok(va) = u32::from_str_radix(va_txt.trim_start_matches("0x"), 16) else {
+            eprintln!("[gancho-log] endereço inválido `{va_txt}` em YW_HOOK_LOG");
+            continue;
+        };
+        let mut modo: &'static str = "antes";
+        let mut extras: Vec<String> = Vec::new();
+        for c in campos {
+            match c {
+                "antes" => modo = "antes",
+                "depois" => modo = "depois",
+                "em" => modo = "em",
+                _ => extras.push(c.to_string()),
+            }
+        }
+        let nome: &'static str = Box::leak(format!("log {va:#x} {modo}").into_boxed_str());
+        let n = std::sync::Arc::new(AtomicU64::new(0));
+        let linha = move |c: &Cpu, e: Option<&Entrada>| {
+            if n.fetch_add(1, Ordering::Relaxed) >= max {
+                return;
+            }
+            let q = super::VBLANKS.load(Ordering::Relaxed);
+            let mut s = format!(
+                "[gancho-log] {va:#x} {modo} q={q} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x} sp={:#x}",
+                c.r[0], c.r[1], c.r[2], c.r[3], c.r[14], c.r[13]
+            );
+            if let Some(e) = e {
+                s += &format!(" | entrada r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x}", e.r[0], e.r[1], e.r[2], e.r[3], e.lr);
+            }
+            for x in &extras {
+                s += &log_extra(c, e, x);
+            }
+            eprintln!("{s}");
+        };
+        let r = match modo {
+            "depois" => registrar(va, Tipo::depois(move |c, e| linha(c, Some(e))), nome, i32::MAX, true),
+            "em" => registrar_em(va, nome, i32::MAX, true, move |c| linha(c, None)),
+            _ => registrar(va, Tipo::antes(move |c| linha(c, None)), nome, i32::MAX, true),
+        };
+        match r {
+            Ok(_) => eprintln!("[gancho-log] {nome} registrado (até {max} linhas)"),
+            Err(e) => eprintln!("[gancho-log] {e}"),
+        }
+    }
+}
+
+/// `sN` / `xN+OFF/LEN` de [`registrar_log_env`]. Num gancho "depois", o registro é o da ENTRADA (r0..r3).
+fn log_extra(c: &Cpu, e: Option<&Entrada>, x: &str) -> String {
+    let reg = |t: &str| -> Option<u32> {
+        let i: usize = t.parse().ok()?;
+        match e {
+            Some(e) if i < 4 => Some(e.r[i]),
+            _ => c.r.get(i).copied(),
+        }
+    };
+    if let Some(t) = x.strip_prefix('s') {
+        let Some(mut a) = reg(t) else { return format!(" {x}=?") };
+        let mut txt = String::new();
+        while txt.len() < 160 && super::mem::is_mapped(a) {
+            let b = yw1_rt::r8(a);
+            if b == 0 {
+                break;
+            }
+            txt.push(if (0x20..0x7f).contains(&b) { b as u8 as char } else { '.' });
+            a = a.wrapping_add(1);
+        }
+        return format!(" {x}=\"{txt}\"");
+    }
+    if let Some(t) = x.strip_prefix('x') {
+        let (r, resto) = t.split_once('+').unwrap_or((t.split('/').next().unwrap_or(t), "0"));
+        let (off, len) = resto.split_once('/').unwrap_or((resto, "16"));
+        let off = u32::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
+        let len: u32 = len.parse::<u32>().unwrap_or(16).min(64);
+        let Some(base) = reg(r) else { return format!(" {x}=?") };
+        let a = base.wrapping_add(off);
+        let mut h = String::new();
+        for i in 0..len {
+            let p = a.wrapping_add(i);
+            if !super::mem::is_mapped(p) {
+                h += " ??";
+                break;
+            }
+            h += &format!("{}{:02x}", if i % 4 == 0 { " " } else { "" }, yw1_rt::r8(p));
+        }
+        return format!(" {x}@{a:#x}:{h}");
+    }
+    format!(" {x}=?")
+}
+
 #[cfg(test)]
 mod tests {
     //! Funções "guest" de mentira em Rust com EXATAMENTE o cabeçalho que o gerador emite, e tabelas falsas no lugar

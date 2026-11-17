@@ -88,6 +88,62 @@ impl Filtro {
     }
 }
 
+/// Proporção da tela de cima (widescreen, G3). A cena 3D fica mais larga sem esticar (o jogo enxerga o frustum largo);
+/// a HUD fica no retângulo 5:3 central. Só no renderizador Vulkan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Proporcao {
+    /// 5:3, como no 3DS (400×240)
+    #[default]
+    #[serde(rename = "original")]
+    Original,
+    #[serde(rename = "16:9")]
+    P16x9,
+    #[serde(rename = "16:10")]
+    P16x10,
+    #[serde(rename = "21:9")]
+    P21x9,
+    /// a proporção da área que a tela de cima tem na janela (no layout escolhido)
+    #[serde(rename = "janela")]
+    Janela,
+}
+
+impl Proporcao {
+    pub const ALL: [Proporcao; 5] = [Proporcao::Original, Proporcao::P16x9, Proporcao::P16x10, Proporcao::P21x9, Proporcao::Janela];
+    pub fn nome(self) -> &'static str {
+        match self {
+            Proporcao::Original => "Original (5:3)",
+            Proporcao::P16x9 => "16:9",
+            Proporcao::P16x10 => "16:10",
+            Proporcao::P21x9 => "21:9",
+            Proporcao::Janela => "Seguir a janela",
+        }
+    }
+
+    /// Largura/altura fixa (`None` = seguir a janela, decidida por quem desenha).
+    pub fn valor(self) -> Option<f32> {
+        match self {
+            Proporcao::Original => Some(5.0 / 3.0),
+            Proporcao::P16x9 => Some(16.0 / 9.0),
+            Proporcao::P16x10 => Some(16.0 / 10.0),
+            Proporcao::P21x9 => Some(21.0 / 9.0),
+            Proporcao::Janela => None,
+        }
+    }
+
+    /// `YW_ASPECT`: `original`/`5:3`, `16:9`, `16:10`, `21:9`, `janela`. Outros valores (`32:9`, `1.9`) não têm entrada
+    /// no menu: o renderizador os lê direto (`render::aspect`) e a janela não sobrescreve.
+    pub fn parse(t: &str) -> Option<Proporcao> {
+        match t.trim().to_ascii_lowercase().as_str() {
+            "original" | "5:3" => Some(Proporcao::Original),
+            "16:9" => Some(Proporcao::P16x9),
+            "16:10" => Some(Proporcao::P16x10),
+            "21:9" => Some(Proporcao::P21x9),
+            "janela" | "seguir" => Some(Proporcao::Janela),
+            _ => None,
+        }
+    }
+}
+
 /// Como os quadros da janela são entregues ao monitor (`VkPresentModeKHR`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,11 +303,13 @@ pub enum Botao {
     AnalogicoBaixo,
     AnalogicoEsquerda,
     AnalogicoDireita,
+    /// não é do 3DS: SEGURAR acelera o console (`hle::turbo`, `emulacao.turbo`)
+    Turbo,
 }
 
 impl Botao {
     /// Todas as entradas, na ordem em que aparecem no menu (teclado).
-    pub const ALL: [Botao; 16] = [
+    pub const ALL: [Botao; 17] = [
         Botao::A,
         Botao::B,
         Botao::X,
@@ -268,9 +326,10 @@ impl Botao {
         Botao::AnalogicoBaixo,
         Botao::AnalogicoEsquerda,
         Botao::AnalogicoDireita,
+        Botao::Turbo,
     ];
     /// As que existem como botão no controle (o Circle Pad é o analógico esquerdo).
-    pub const PAD: [Botao; 12] = [
+    pub const PAD: [Botao; 13] = [
         Botao::A,
         Botao::B,
         Botao::X,
@@ -283,6 +342,7 @@ impl Botao {
         Botao::Baixo,
         Botao::Esquerda,
         Botao::Direita,
+        Botao::Turbo,
     ];
 
     pub fn nome(self) -> &'static str {
@@ -303,6 +363,7 @@ impl Botao {
             Botao::AnalogicoBaixo => "Circle Pad ↓",
             Botao::AnalogicoEsquerda => "Circle Pad ←",
             Botao::AnalogicoDireita => "Circle Pad →",
+            Botao::Turbo => "Turbo (segurar)",
         }
     }
 
@@ -346,11 +407,14 @@ pub struct Teclado {
     pub analogico_baixo: Vec<KeyCode>,
     pub analogico_esquerda: Vec<KeyCode>,
     pub analogico_direita: Vec<KeyCode>,
+    /// segurar = turbo (padrão Tab)
+    pub turbo: Vec<KeyCode>,
 }
 
 impl Default for Teclado {
     /// Os mesmos atalhos da janela anterior (minifb): setas = direcional, WASD = Circle Pad, Z/Espaço/K = A,
-    /// X/Backspace/L = B, C/I = X, V/J = Y, Q = L, E = R, Enter = Start, Tab/Shift direito = Select.
+    /// X/Backspace/L = B, C/I = X, V/J = Y, Q = L, E = R, Enter = Start, Shift direito = Select; Tab = turbo
+    /// (G6, decisão do Paulo; antes o Tab era Select).
     fn default() -> Self {
         use KeyCode::*;
         Teclado {
@@ -361,7 +425,7 @@ impl Default for Teclado {
             l: vec![KeyQ],
             r: vec![KeyE],
             start: vec![Enter],
-            select: vec![Tab, ShiftRight],
+            select: vec![ShiftRight],
             cima: vec![ArrowUp],
             baixo: vec![ArrowDown],
             esquerda: vec![ArrowLeft],
@@ -370,6 +434,7 @@ impl Default for Teclado {
             analogico_baixo: vec![KeyS],
             analogico_esquerda: vec![KeyA],
             analogico_direita: vec![KeyD],
+            turbo: vec![Tab],
         }
     }
 }
@@ -393,6 +458,7 @@ impl Teclado {
             Botao::AnalogicoBaixo => &self.analogico_baixo,
             Botao::AnalogicoEsquerda => &self.analogico_esquerda,
             Botao::AnalogicoDireita => &self.analogico_direita,
+            Botao::Turbo => &self.turbo,
         }
     }
 
@@ -414,6 +480,7 @@ impl Teclado {
             Botao::AnalogicoBaixo => &mut self.analogico_baixo,
             Botao::AnalogicoEsquerda => &mut self.analogico_esquerda,
             Botao::AnalogicoDireita => &mut self.analogico_direita,
+            Botao::Turbo => &mut self.turbo,
         }
     }
 
@@ -459,6 +526,8 @@ pub struct Controle {
     pub baixo: Pad,
     pub esquerda: Pad,
     pub direita: Pad,
+    /// segurar = turbo (padrão: clique do analógico direito; `Unknown` = nenhum)
+    pub turbo: Pad,
 }
 
 impl Default for Controle {
@@ -489,6 +558,7 @@ impl Controle {
             baixo: Pad::DPadDown,
             esquerda: Pad::DPadLeft,
             direita: Pad::DPadRight,
+            turbo: Pad::RightThumb,
         }
     }
 
@@ -516,6 +586,7 @@ impl Controle {
             Botao::Baixo => self.baixo,
             Botao::Esquerda => self.esquerda,
             Botao::Direita => self.direita,
+            Botao::Turbo => self.turbo,
             _ => return None,
         })
     }
@@ -534,6 +605,7 @@ impl Controle {
             Botao::Baixo => &mut self.baixo,
             Botao::Esquerda => &mut self.esquerda,
             Botao::Direita => &mut self.direita,
+            Botao::Turbo => &mut self.turbo,
             _ => return None,
         })
     }
@@ -589,6 +661,12 @@ pub struct Graficos {
     /// execução dos lotes no Vulkan: assíncrona (padrão) ou síncrona
     #[serde(default)]
     pub renderizacao: Renderizacao,
+    /// proporção da tela de cima (widescreen); vale na hora; `YW_ASPECT` manda por cima
+    #[serde(default)]
+    pub proporcao: Proporcao,
+    /// HUD ancorada nas bordas no widescreen (G5); desligada = HUD no retângulo 5:3 do meio. Vale na hora;
+    /// `YW_HUD_ANCORA` manda por cima. Sem atributo por campo: falta no arquivo = padrão da struct (ligada)
+    pub hud_ancorada: bool,
 }
 
 impl Default for Graficos {
@@ -612,6 +690,8 @@ impl Default for Graficos {
             interpolacao: 0,
             estereo_3d: false,
             renderizacao: Renderizacao::Assincrona,
+            proporcao: Proporcao::Original,
+            hud_ancorada: true,
         }
     }
 }
@@ -630,11 +710,41 @@ impl Default for Som {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Emulacao {
     /// idioma do console; vale no próximo início
     pub idioma: Idioma,
+    /// multiplicador do turbo (2–4) enquanto a tecla/botão do turbo é segurado (`hle::turbo`; `YW_TURBO` vence)
+    pub turbo: u32,
+}
+
+impl Default for Emulacao {
+    fn default() -> Self {
+        Emulacao { idioma: Idioma::default(), turbo: 3 }
+    }
+}
+
+/// Ferramentas de desenvolvedor (`hle::dev`, F3): desligadas por padrão; `YW_DEV=1`/`0` vence o arquivo.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dev {
+    pub ferramentas: bool,
+    /// valores vigiados na janela de memória: "0xENDEREÇO:tipo" (tipo u8 u16 u32 i32 f32)
+    pub vigiados: Vec<String>,
+}
+
+/// Mods (`hle::mods`): o que o menu escolheu. Tudo vale ao reiniciar. Um mod é identificado pelo nome da pasta.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mods {
+    /// ordem escolhida no menu (o primeiro vence quando dois mods trocam o mesmo arquivo); vazia = pela
+    /// `prioridade` do `mod.toml` (maior primeiro). Mods que não estão aqui vão depois dos listados, pela prioridade
+    pub ordem: Vec<String>,
+    /// mods desligados (os de arquivos vêm ligados)
+    pub desligados: Vec<String>,
+    /// mods cujo CÓDIGO (DLL) foi ligado — código nativo com confiança total, desligado por padrão
+    pub codigo_ligado: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -645,6 +755,8 @@ pub struct Settings {
     pub teclado: Teclado,
     pub controle: Controle,
     pub emulacao: Emulacao,
+    pub mods: Mods,
+    pub dev: Dev,
 }
 
 impl Settings {
@@ -732,6 +844,20 @@ impl Settings {
         self.som.volume = self.som.volume.min(100);
         let z = self.controle.zona_morta;
         self.controle.zona_morta = if z.is_finite() { z.clamp(0.0, 0.9) } else { 0.2 };
+        self.emulacao.turbo = self.emulacao.turbo.clamp(2, 4);
+        // arquivo de antes do turbo: `select = [Tab, ShiftRight]` e o turbo entra no padrão (Tab). A tecla do turbo
+        // sai das outras entradas (uma tecla nunca aperta duas coisas); o botão do controle do turbo que já for de
+        // outra entrada fica sem turbo (Unknown = nenhum).
+        let tk = self.teclado.turbo.clone();
+        for b in Botao::ALL {
+            if b != Botao::Turbo {
+                self.teclado.get_mut(b).retain(|k| !tk.contains(k));
+            }
+        }
+        let tp = self.controle.turbo;
+        if tp != Pad::Unknown && Botao::PAD.iter().any(|&b| b != Botao::Turbo && self.controle.get(b) == Some(tp)) {
+            self.controle.turbo = Pad::Unknown;
+        }
     }
 }
 
@@ -811,6 +937,8 @@ pub struct EnvOverrides {
     pub scale: Option<u32>,
     pub pad_layout: Option<PadLayout>,
     pub volume: Option<u32>,
+    /// `YW_ASPECT` (só os valores que o menu tem)
+    pub proporcao: Option<Proporcao>,
 }
 
 impl EnvOverrides {
@@ -839,6 +967,7 @@ impl EnvOverrides {
             volume: get("YW_VOLUME")
                 .and_then(|v| v.trim().parse::<f32>().ok())
                 .map(|v| v.clamp(0.0, 100.0).round() as u32),
+            proporcao: get("YW_ASPECT").and_then(|v| Proporcao::parse(&v)),
         }
     }
 
@@ -858,6 +987,9 @@ impl EnvOverrides {
         }
         if let Some(v) = self.volume {
             s.som.volume = v;
+        }
+        if let Some(p) = self.proporcao {
+            s.graficos.proporcao = p;
         }
         s
     }
@@ -884,6 +1016,9 @@ impl EnvOverrides {
         }
         if self.volume.is_some() && current.som.volume == applied.som.volume {
             s.som.volume = file.som.volume;
+        }
+        if self.proporcao.is_some() && current.graficos.proporcao == applied.graficos.proporcao {
+            s.graficos.proporcao = file.graficos.proporcao;
         }
         s
     }
@@ -1001,6 +1136,29 @@ qualquer = 1
     }
 
     #[test]
+    fn arquivo_antigo_tab_vira_turbo() {
+        // arquivo gravado antes do turbo: Select com Tab, sem `turbo`; o controle já usava o R3 para o Start
+        let (s, _) = Settings::from_toml_report(
+            "[teclado]
+select = [\"Tab\", \"ShiftRight\"]
+[controle]
+start = \"RightThumb\"
+select = \"Select\"
+[emulacao]
+turbo = 9
+",
+        )
+        .unwrap();
+        assert_eq!(s.teclado.turbo, vec![KeyCode::Tab]);
+        assert_eq!(s.teclado.select, vec![KeyCode::ShiftRight]);
+        assert_eq!(s.controle.turbo, Pad::Unknown, "R3 já era do Start");
+        assert_eq!(s.emulacao.turbo, 4);
+        assert!(!s.dev.ferramentas);
+        assert_eq!(Settings::default().emulacao.turbo, 3);
+        assert_eq!(Settings::default().controle.turbo, Pad::RightThumb);
+    }
+
+    #[test]
     fn remapear_tecla_tira_de_outra_entrada() {
         let mut t = Teclado::default();
         t.assign(Botao::Y, 0, KeyCode::KeyZ); // Z era de A
@@ -1079,5 +1237,36 @@ qualquer = 1
         assert_eq!(saved.som.volume, 55);
         assert_eq!(saved.graficos.escala_janela, 2);
         assert_eq!(EnvOverrides::parse(|_| None), EnvOverrides::default());
+        // YW_ASPECT: os valores do menu; o resto fica com o renderizador (`render::parse_aspect`)
+        let e = EnvOverrides::parse(|k| (k == "YW_ASPECT").then(|| "16:9".to_string()));
+        assert_eq!(e.proporcao, Some(Proporcao::P16x9));
+        let arquivo = Settings::default();
+        assert_eq!(e.apply(&arquivo).graficos.proporcao, Proporcao::P16x9);
+        assert_eq!(e.to_save(&e.apply(&arquivo), &arquivo).graficos.proporcao, Proporcao::Original);
+        assert_eq!(EnvOverrides::parse(|k| (k == "YW_ASPECT").then(|| "32:9".to_string())).proporcao, None);
+    }
+
+    #[test]
+    fn hud_ancorada_padrao_ligada() {
+        // arquivo antigo, sem o campo: vale o padrão da struct (ligada), não o `false` do tipo
+        let t = "[graficos]
+proporcao = \"16:9\"
+";
+        assert!(Settings::from_toml(t).unwrap().graficos.hud_ancorada);
+        let mut s = Settings::default();
+        s.graficos.hud_ancorada = false;
+        assert!(!Settings::from_toml(&s.to_toml()).unwrap().graficos.hud_ancorada);
+    }
+
+    #[test]
+    fn proporcao_no_toml() {
+        let mut s = Settings::default();
+        s.graficos.proporcao = Proporcao::P21x9;
+        let t = s.to_toml();
+        assert!(t.contains("proporcao = \"21:9\""), "{t}");
+        assert_eq!(Settings::from_toml(&t).unwrap().graficos.proporcao, Proporcao::P21x9);
+        for p in Proporcao::ALL {
+            assert!(p.valor().is_none_or(|v| v > 1.5 && v < 2.4));
+        }
     }
 }

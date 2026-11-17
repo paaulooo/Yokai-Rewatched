@@ -2,7 +2,7 @@
 (cadência da interpolação, redesenhos, apresentação). Nunca captura a área de trabalho: as medidas vêm do log
 (linhas `[janela]`, a cada 5 s).
 
-    python window_run.py NOME --secs 150 [--input "20:start; +8:a"] [--set graficos.interpolacao=120 ...]
+    python window_run.py NOME --secs 150 [--input "20:start; +8:a"] [--set graficos.interpolacao=120 ...] [--exe CAMINHO]
 
 As configurações do usuário (%APPDATA%/yw1/settings.toml) não são tocadas: o teste usa uma CÓPIA em
 work/runs/NOME/settings.toml, com os `--set seção.chave=valor` aplicados (`YW_SETTINGS_TOML`). Sem som (YW_AUDIO=none).
@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--input", default="")
     ap.add_argument("--set", action="append", default=[], help="seção.chave=valor no settings.toml da cópia")
     ap.add_argument("--env", action="append", default=[], help="VAR=valor extra no ambiente")
+    ap.add_argument("--exe", default=str(EXE), help="executável (padrão: work/recomp/target/release/yw1r.exe)")
     a = ap.parse_args()
     out = WORK / "runs" / a.name
     out.mkdir(parents=True, exist_ok=True)
@@ -69,7 +70,7 @@ def main():
         env["YW_INPUT"] = a.input
     log = WORK / "runs" / f"{a.name}.log"
     with open(log, "w", encoding="utf8", errors="replace") as f:
-        r = subprocess.run([str(EXE)], cwd=EXE.parent.parent.parent, env=env, stdout=f, stderr=subprocess.STDOUT,
+        r = subprocess.run([a.exe], cwd=EXE.parent.parent.parent, env=env, stdout=f, stderr=subprocess.STDOUT,
                            timeout=a.secs + 90)
     lines = log.read_text(encoding="utf8", errors="replace").splitlines()
     print(f"saída {r.returncode} · log {log}")

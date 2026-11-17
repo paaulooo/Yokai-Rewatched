@@ -1,0 +1,12 @@
+[package]
+name = "yw1-modapi"
+version = "0.1.0"
+edition = "2021"
+description = "ABI C dos mods de código do Yo-kai Watch recompilado (yw1r) + invólucro Rust seguro"
+publish = false
+
+[lib]
+name = "yw1_modapi"
+path = "src/lib.rs"
+
+[dependencies]

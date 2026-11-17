@@ -24,20 +24,31 @@ impl Rect {
 
 /// Tamanho do conjunto das telas em escala 1 (pixels do 3DS).
 pub fn base_size(layout: Layout) -> (u32, u32) {
+    let (w, h) = base_size_w(layout, TOP.0);
+    (w.round() as u32, h.round() as u32)
+}
+
+/// Como `base_size`, com a tela de cima `top_w` pixels de largura (widescreen, G3: 240·proporção; 400 = original).
+pub fn base_size_w(layout: Layout, top_w: f32) -> (f32, f32) {
     match layout {
-        Layout::Empilhadas => (400, 480),
-        Layout::LadoALado => (720, 240),
-        Layout::SoCima => (400, 240),
-        Layout::SoBaixo => (320, 240),
+        Layout::Empilhadas => (top_w.max(BOTTOM.0), 480.0),
+        Layout::LadoALado => (top_w + BOTTOM.0, 240.0),
+        Layout::SoCima => (top_w, 240.0),
+        Layout::SoBaixo => (BOTTOM.0, 240.0),
         // tela de baixo com metade do tamanho, à direita da de cima
-        Layout::GrandePequena => (560, 240),
+        Layout::GrandePequena => (top_w + BOTTOM.0 / 2.0, 240.0),
     }
 }
 
 /// (tela de cima, tela de baixo) dentro de uma janela `win_w`×`win_h`; `None` = tela não aparece.
 pub fn place(layout: Layout, win_w: f32, win_h: f32, integer: bool) -> (Option<Rect>, Option<Rect>) {
-    let (bw, bh) = base_size(layout);
-    let (bw, bh) = (bw as f32, bh as f32);
+    place_w(layout, TOP.0, win_w, win_h, integer)
+}
+
+/// Como `place`, com a tela de cima `top_w` pixels de largura (widescreen). A de baixo não muda; nas empilhadas as
+/// duas ficam centralizadas na horizontal.
+pub fn place_w(layout: Layout, top_w: f32, win_w: f32, win_h: f32, integer: bool) -> (Option<Rect>, Option<Rect>) {
+    let (bw, bh) = base_size_w(layout, top_w);
     let mut s = (win_w / bw).min(win_h / bh);
     if !(s.is_finite() && s > 0.0) {
         return (None, None);
@@ -52,11 +63,14 @@ pub fn place(layout: Layout, win_w: f32, win_h: f32, integer: bool) -> (Option<R
         oy = oy.floor();
     }
     let r = |x: f32, y: f32, w: f32, h: f32| Rect { x: ox + x, y: oy + y, w, h };
-    let top = || r(0.0, 0.0, TOP.0 * s, TOP.1 * s);
+    let top = |x: f32| r(x, 0.0, top_w * s, TOP.1 * s);
     match layout {
-        Layout::Empilhadas => (Some(top()), Some(r(40.0 * s, 240.0 * s, BOTTOM.0 * s, BOTTOM.1 * s))),
-        Layout::LadoALado => (Some(top()), Some(r(400.0 * s, 0.0, BOTTOM.0 * s, BOTTOM.1 * s))),
-        Layout::SoCima => (Some(top()), None),
+        Layout::Empilhadas => (
+            Some(top((bw - top_w) / 2.0 * s)),
+            Some(r((bw - BOTTOM.0) / 2.0 * s, 240.0 * s, BOTTOM.0 * s, BOTTOM.1 * s)),
+        ),
+        Layout::LadoALado => (Some(top(0.0)), Some(r(top_w * s, 0.0, BOTTOM.0 * s, BOTTOM.1 * s))),
+        Layout::SoCima => (Some(top(0.0)), None),
         Layout::SoBaixo => (None, Some(r(0.0, 0.0, BOTTOM.0 * s, BOTTOM.1 * s))),
         Layout::GrandePequena => {
             let mut small = s * 0.5;
@@ -64,11 +78,28 @@ pub fn place(layout: Layout, win_w: f32, win_h: f32, integer: bool) -> (Option<R
                 small = small.floor();
             }
             (
-                Some(top()),
-                Some(r(400.0 * s, 240.0 * s - 240.0 * small, BOTTOM.0 * small, BOTTOM.1 * small)),
+                Some(top(0.0)),
+                Some(r(top_w * s, 240.0 * s - 240.0 * small, BOTTOM.0 * small, BOTTOM.1 * small)),
             )
         }
     }
+}
+
+/// "Seguir a janela" (widescreen): a proporção (largura/altura) que a tela de cima precisa ter para o layout encher
+/// uma janela `win_w`×`win_h`. `None` = layout sem tela de cima ou janela sem tamanho.
+pub fn aspect_para_janela(layout: Layout, win_w: f32, win_h: f32) -> Option<f32> {
+    if !(win_w > 0.0 && win_h > 0.0) {
+        return None;
+    }
+    let r = win_w / win_h;
+    let top_w = match layout {
+        Layout::SoCima => 240.0 * r,
+        Layout::Empilhadas => 480.0 * r,
+        Layout::LadoALado => 240.0 * r - BOTTOM.0,
+        Layout::GrandePequena => 240.0 * r - BOTTOM.0 / 2.0,
+        Layout::SoBaixo => return None,
+    };
+    (top_w > 0.0).then_some(top_w / 240.0)
 }
 
 /// Posição do mouse (pixels da janela) → coordenada do toque (0–319 × 0–239), se estiver sobre a tela de baixo.
@@ -179,6 +210,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn widescreen_tela_de_cima_mais_larga_e_de_baixo_igual() {
+        // 16:9 (426,7 px) empilhadas numa janela 2×: as duas centralizadas, a de baixo com o mesmo tamanho
+        let tw = 240.0 * 16.0 / 9.0;
+        let (t, b) = place_w(Layout::Empilhadas, tw, tw * 2.0, 960.0, false);
+        let (t, b) = (t.unwrap(), b.unwrap());
+        assert!((t.w / t.h - 16.0 / 9.0).abs() < 1e-4 && t.x.abs() < 1e-3);
+        assert!((b.w - 640.0).abs() < 1e-3 && (b.x - (tw * 2.0 - 640.0) / 2.0).abs() < 1e-3);
+        for layout in [Layout::LadoALado, Layout::GrandePequena, Layout::SoCima] {
+            let (t, b) = place_w(layout, 560.0, 1920.0, 1080.0, false);
+            assert!((t.unwrap().w / t.unwrap().h - 560.0 / 240.0).abs() < 1e-4, "{layout:?}");
+            if let Some(b) = b {
+                assert!((b.w / b.h - 320.0 / 240.0).abs() < 1e-4, "{layout:?}");
+            }
+        }
+        // 400 = exatamente o place de sempre
+        for layout in Layout::ALL {
+            assert_eq!(place_w(layout, 400.0, 1234.0, 777.0, true), place(layout, 1234.0, 777.0, true));
+        }
+    }
+
+    #[test]
+    fn seguir_a_janela_enche_a_janela() {
+        for layout in [Layout::SoCima, Layout::Empilhadas, Layout::LadoALado, Layout::GrandePequena] {
+            let (w, h) = (2560.0, 1080.0);
+            let a = aspect_para_janela(layout, w, h).unwrap();
+            let (bw, bh) = base_size_w(layout, 240.0 * a);
+            assert!((bw / bh - w / h).abs() < 1e-3, "{layout:?}");
+        }
+        assert_eq!(aspect_para_janela(Layout::SoBaixo, 800.0, 600.0), None);
     }
 
     #[test]

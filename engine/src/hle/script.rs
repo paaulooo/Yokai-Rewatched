@@ -5,6 +5,8 @@
 //! - AÇÃO = botões unidos por `+`: `a b x y l r start select up down left right`
 //! - ou `touch(x,y)` na tela de baixo (0–319, 0–239)
 //! - ou `stick(x,y)` no direcional analógico (−1…1; y positivo = para cima), como o teclado/gamepad da janela
+//! - `turbo` (sozinho ou unido a botões) segura o turbo (`hle::turbo`) pela duração; o tempo do roteiro é o do JOGO
+//!   (VBlanks), então os eventos seguintes caem no mesmo ponto do jogo com ou sem turbo
 //! - `TEMPO` pode ser `+N` = N segundos depois do evento anterior
 //!
 //! Ex.: `YW_INPUT="20:start; +2:a; +1.5:down/0.3; +1:touch(160,200)"`.
@@ -20,6 +22,9 @@ pub struct Event {
     pub touch: Option<(u32, u32)>,
     pub stick: Option<(f32, f32)>,
 }
+
+/// "Botão" do turbo no roteiro: bit que o HID não usa (24); sai da palavra antes de ir para o HID.
+pub const TURBO_BIT: u32 = 1 << 24;
 
 /// Estado de entrada num instante: botões, toque, analógico.
 pub type State = (u32, Option<(u32, u32)>, Option<(f32, f32)>);
@@ -38,6 +43,7 @@ fn button(name: &str) -> Option<u32> {
         "l" => 1 << 9,
         "x" => 1 << 10,
         "y" => 1 << 11,
+        "turbo" => TURBO_BIT,
         _ => return None,
     })
 }
@@ -165,7 +171,11 @@ pub fn start_from_env() {
                     let l = live_state(p);
                     now = (now.0 | l.0, l.1.or(now.1), l.2.or(now.2));
                 }
+                if now.0 & TURBO_BIT != prev.0 & TURBO_BIT {
+                    super::turbo::segurar(super::turbo::ROTEIRO, now.0 & TURBO_BIT != 0);
+                }
                 if now != prev {
+                    let now = (now.0 & !TURBO_BIT, now.1, now.2);
                     // mesma codificação da janela (window.rs): toque = x | y << 9 | válido << 31, e bit 20 nos botões
                     hid::TOUCH.store(now.1.map_or(0, |(x, y)| x | y << 9 | 1 << 31), Ordering::Relaxed);
                     let (sw, sb) = stick_word(now.2);
@@ -174,8 +184,8 @@ pub fn start_from_env() {
                     if now.0 != 0 || now.1.is_some() || now.2.is_some() {
                         eprintln!("[input] {t:.2}s botões {:#x} toque {:?} analógico {:?}", now.0, now.1, now.2);
                     }
-                    prev = now;
                 }
+                prev = now;
                 std::thread::sleep(std::time::Duration::from_millis(4));
             }
         })
@@ -200,5 +210,8 @@ mod tests {
         assert_eq!(state_at(&s, 2.0).2, Some((0.5, -1.0)));
         assert_eq!(stick_word(Some((0.5, -1.0))).1, (1 << 28) | (1 << 31));
         assert!(parse("1:zz").is_err());
+        let t = parse("10:turbo/5; 12:a+turbo").unwrap();
+        assert_eq!(state_at(&t, 11.0).0, TURBO_BIT);
+        assert_eq!(state_at(&t, 12.05).0, TURBO_BIT | 1);
     }
 }

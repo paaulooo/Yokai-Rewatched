@@ -3,6 +3,8 @@
 //! Velocidade travada na normal: VBlank a ≈59,83 Hz (LCD do 3DS) e quadros de áudio a 32728/160 Hz; o jogo se
 //! cadencia sozinho esperando esses eventos. Sem desbloqueio de FPS por enquanto (pedido do Paulo).
 
+pub mod dev;
+pub mod etiquetas;
 pub mod fsr;
 pub mod gpu;
 pub mod hooks;
@@ -12,11 +14,14 @@ pub mod logs;
 pub mod mem;
 pub mod memmap;
 pub mod menu;
+pub mod mods;
 pub mod present;
 pub mod script;
 pub mod services;
 pub mod settings;
+pub mod turbo;
 pub mod watchdog;
+pub mod widescreen;
 pub mod window;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,6 +44,23 @@ pub fn vblank_hz() -> f64 {
     VBLANK_HZ * vblank_mult()
 }
 const AUDIO_HZ: f64 = 32728.498 / 160.0;
+
+/// Relógio do VBlank em segundos de PAREDE do console (sem pausas, sem `YW_SPEED`): cada VBlank soma 1/(hz·turbo).
+/// Sem turbo é igual a `VBLANKS / vblank_hz()`; com turbo anda mais devagar que o tempo do jogo. É por ele que o vigia
+/// mede "3 s sem quadro" e que a linha de desempenho divide os quadros (quadros do jogo por segundo de verdade).
+static RELOGIO_NS: AtomicU64 = AtomicU64::new(0);
+
+fn relogio_avanca(fator: f64) {
+    RELOGIO_NS.fetch_add((1e9 / (vblank_hz() * fator)).round() as u64, Ordering::Relaxed);
+    if fator != 1.0 {
+        turbo::VBLANKS_TURBO.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Ver [`RELOGIO_NS`].
+pub fn relogio_vblank_s() -> f64 {
+    RELOGIO_NS.load(Ordering::Relaxed) as f64 / 1e9
+}
 
 const BSS_END: u32 = 0x005f_ccd4 + 0x000a_8408;
 const MAIN_PRIO: i32 = 0x30;
@@ -94,13 +116,15 @@ pub fn paused_ns() -> u64 {
     PAUSED_NS.load(Ordering::SeqCst) + g.map_or(0, |t| t.elapsed().as_nanos() as u64)
 }
 
-/// Espera o instante do `n`-ésimo evento de um relógio de `hz` (começado em `t0`), descontando as pausas.
-fn clock_wait(t0: Instant, n: u64, hz: f64) {
+/// Espera o instante do `n`-ésimo evento de um relógio de `hz` (começado em `t0`, quando a soma das pausas era
+/// `pausa0`), descontando as pausas.
+fn clock_wait(t0: Instant, pausa0: u64, n: u64, hz: f64) {
     loop {
         while paused() {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let due = t0 + Duration::from_nanos(PAUSED_NS.load(Ordering::SeqCst)) + Duration::from_secs_f64(n as f64 / hz);
+        let pausa = PAUSED_NS.load(Ordering::SeqCst).saturating_sub(pausa0);
+        let due = t0 + Duration::from_nanos(pausa) + Duration::from_secs_f64(n as f64 / hz);
         match due.checked_duration_since(Instant::now()) {
             Some(d) => std::thread::sleep(d),
             None if !paused() => return,
@@ -289,10 +313,24 @@ pub fn boot() {
     }
     // sem janela (`run_headless`) ninguém leu as configurações ainda: o modo estéreo vem do arquivo aqui
     if !STEREO_SET.load(Ordering::SeqCst) {
-        set_stereo_from_settings(settings::load().graficos.estereo_3d);
+        let s = settings::load();
+        set_stereo_from_settings(s.graficos.estereo_3d);
+        turbo::set_mult(s.emulacao.turbo);
+        if dev::ligado(&s) {
+            dev::PEDIDO.store(true, Ordering::SeqCst);
+        }
     }
     eprintln!("[hle] 3D estéreo {}", if yw1_rt::stereo() { "ligado" } else { "desligado (modo mono)" });
     registrar_ganchos_essenciais();
+    // widescreen da tela de cima (G3): projeção e culling com o frustum largo (inativos com a proporção original)
+    widescreen::registrar();
+    hooks::registrar_log_env();
+    // mods (G2): índice de arquivos + ganchos de abertura e DLLs ligadas, antes da primeira instrução guest
+    mods::iniciar();
+    // ferramentas de desenvolvedor (G6): ganchos só de leitura (arquivos abertos, câmera)
+    if dev::PEDIDO.load(Ordering::SeqCst) {
+        dev::instalar();
+    }
     install_fault_handler();
     mem::init();
     let code = code_bin();
@@ -306,15 +344,38 @@ pub fn boot() {
     std::thread::Builder::new()
         .name("vblank".into())
         .spawn(|| {
-            let t0 = Instant::now();
+            // prazo absoluto t0 + n/hz; o turbo (`turbo::fator`) troca hz ao vivo: na troca a base passa a ser o
+            // instante do último VBlank (t0 = prazo dele, n = 0), então o ritmo novo começa dali sem salto nem rajada
+            let (mut t0, mut pausa0) = (Instant::now(), PAUSED_NS.load(Ordering::SeqCst));
+            let mut fator = turbo::fator();
+            let mut hz = vblank_hz() * speed() * fator;
             let mut n: u64 = 0;
+            // diagnóstico da troca de ritmo: (latência pedido → troca, instante do último VBlank no ritmo antigo)
+            let mut troca: Option<(Duration, Instant)> = None;
             loop {
                 n += 1;
-                clock_wait(t0, n, vblank_hz() * speed());
+                clock_wait(t0, pausa0, n, hz);
+                if let Some((lat, ultimo)) = troca.take() {
+                    eprintln!(
+                        "[turbo] ritmo {:.1} VBlanks/s: troca {:.1} ms depois do pedido, 1º VBlank novo {:.1} ms depois do último",
+                        hz / speed(),
+                        lat.as_secs_f64() * 1000.0,
+                        ultimo.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 services::gsp::interrupt(services::gsp::PDC0);
                 services::gsp::interrupt(services::gsp::PDC1);
                 services::hid::update(kernel::system_tick());
+                relogio_avanca(fator);
                 VBLANKS.fetch_add(1, Ordering::Relaxed);
+                let f = turbo::fator();
+                if f != fator {
+                    let p = PAUSED_NS.load(Ordering::SeqCst);
+                    t0 += Duration::from_nanos(p.saturating_sub(pausa0)) + Duration::from_secs_f64(n as f64 / hz);
+                    (pausa0, n, fator) = (p, 0, f);
+                    hz = vblank_hz() * speed() * fator;
+                    troca = Some((turbo::tomar_pedido().unwrap_or_default(), Instant::now()));
+                }
             }
         })
         .unwrap();
@@ -325,7 +386,7 @@ pub fn boot() {
             let mut n: u64 = 0;
             loop {
                 n += 1;
-                clock_wait(t0, n, AUDIO_HZ * speed());
+                clock_wait(t0, 0, n, AUDIO_HZ * speed());
                 services::dsp::audio_frame();
             }
         })
@@ -355,6 +416,9 @@ pub fn main() {
 {}", kernel::threads_report());
     }
     hooks::log_resumo();
+    mods::log_resumo();
+    widescreen::log_resumo();
+    dev::log_resumo();
     // cache do driver + lista de pipelines usados (pré-compilação do próximo boot) também ao fechar a janela
     if crate::render::backend() == crate::render::Backend::Vulkan {
         crate::render::vulkan::save_pipeline_cache();
@@ -382,6 +446,9 @@ pub fn run_headless(seconds: f64) {
     let mut next_shot = std::env::var("YW_SHOT_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(every);
     // a cada 5 s do console: quadros que o jogo apresentou por segundo (trocas da tela de cima) — a meta é 30
     let (mut next_rate, mut last_swaps) = (5.0, 0u64);
+    // turbo: o intervalo de 5 s do jogo dura menos na parede; (tempo do jogo, relógio de parede do VBlank, VBlanks em
+    // turbo) no último relatório, para dar quadros por segundo DE PAREDE (sem turbo a razão é 1 e a linha não muda)
+    let (mut last_tg, mut last_rel, mut last_vbt) = (0.0f64, 0.0f64, 0u64);
     let mut last_prof = [0u64; crate::pica::PROF.len()];
     let mut last_st = [0u64; crate::render::vulkan::NSTATS];
     let mut last_host = Instant::now();
@@ -494,9 +561,22 @@ pub fn run_headless(seconds: f64) {
                 mb(host),
                 mb(tex)
             );
+            let rel = relogio_vblank_s();
+            let vbt = turbo::VBLANKS_TURBO.load(Ordering::Relaxed);
+            // só com turbo no intervalo (sem ele a razão é 1 por construção; não arrisca 30,1 por leitura defasada)
+            let razao = if vbt != last_vbt && rel > last_rel { ((t - last_tg) / (rel - last_rel)).max(1.0) } else { 1.0 };
+            let turbo_txt = if vbt != last_vbt {
+                let vb = (t - last_tg) * vblank_hz();
+                let pct = ((vbt - last_vbt) as f64 * 100.0 / vb.max(1.0)).min(100.0);
+                let pct = if pct < 1.0 { "<1".to_string() } else { format!("{pct:.0}") };
+                format!(" · turbo {}× em {pct}% dos VBlanks", turbo::mult())
+            } else {
+                String::new()
+            };
+            (last_tg, last_rel, last_vbt) = (t, rel, vbt);
             eprintln!(
-                "[hle] {t:.0}s: {:.1} quadros/s do jogo · CPU do jogo ociosa {idle:.0}% · thread da GPU (% do relógio): lista PICA {} (shader {} · vk draw {}) · sincronismo {} · transfer {} · fill {} · alta resolução e interpolação {} (pós-transfer {post:.0} %) · draws de vértice AOT {aot} / ubershader {uber}{vk_line}",
-                (s - last_swaps) as f64 / 5.0,
+                "[hle] {t:.0}s: {:.1} quadros/s do jogo{turbo_txt} · CPU do jogo ociosa {idle:.0}% · thread da GPU (% do relógio): lista PICA {} (shader {} · vk draw {}) · sincronismo {} · transfer {} · fill {} · alta resolução e interpolação {} (pós-transfer {post:.0} %) · draws de vértice AOT {aot} / ubershader {uber}{vk_line}",
+                (s - last_swaps) as f64 / 5.0 * razao,
                 p[0], p[1], p[2], p[3], p[4], p[5], p[6]
             );
             (next_rate, last_swaps) = (next_rate + 5.0, s);
@@ -535,6 +615,9 @@ pub fn run_headless(seconds: f64) {
     }
     eprintln!("[hle] threads:\n{}", kernel::threads_report());
     hooks::log_resumo();
+    mods::log_resumo();
+    widescreen::log_resumo();
+    dev::log_resumo();
     if crate::render::backend() == crate::render::Backend::Vulkan {
         crate::render::vulkan::save_pipeline_cache();
     }

@@ -10,6 +10,7 @@ pub mod fs;
 pub mod gsp;
 pub mod hid;
 pub mod misc;
+pub mod romfs;
 pub mod y2r;
 
 use super::kernel::{self, Obj, K, RESULT_OK};

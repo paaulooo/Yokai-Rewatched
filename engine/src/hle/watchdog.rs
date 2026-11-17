@@ -1,5 +1,5 @@
 //! Vigia de travamento: roda em qualquer modo (janela ou sem janela). Se o jogo para de apresentar quadros por mais de
-//! 3 s do console (sem estar pausado pelo menu), escreve no console as linhas `[vigia]` de sempre e, na primeira
+//! 3 s do console (relógio de parede do VBlank: com o turbo também são 3 s de verdade; sem estar pausado pelo menu), escreve no console as linhas `[vigia]` de sempre e, na primeira
 //! detecção, um relatório completo em `stall.log` (pasta de logs da execução, ver `hle::logs`):
 //! threads, registradores da thread em execução, memória apontada por eles, análise de ciclo em listas ligadas
 //! (o travamento já visto: `FUN_001420a8` girando numa fila de buffers de áudio com ciclo) e o histórico recente do
@@ -14,18 +14,22 @@ pub fn start() {
     std::thread::Builder::new()
         .name("vigia".into())
         .spawn(|| {
-            let (mut last_swaps, mut last_t, mut dumps) = (0u64, 0.0f64, 0u32);
+            // limites no relógio de parede do VBlank (`relogio_vblank_s`): com o turbo os VBlanks vêm 2–4× mais
+            // depressa, e "3 s sem quadro" contado em VBlanks viraria 1 s de verdade (uma carga de disco acusaria
+            // travamento). Sem turbo é o mesmo número de antes. `t` (mensagens) continua o tempo do jogo.
+            let (mut last_swaps, mut last_r, mut dumps) = (0u64, 0.0f64, 0u32);
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 if super::paused() {
-                    last_t = VBLANKS.load(Ordering::Relaxed) as f64 / vblank_hz();
+                    last_r = super::relogio_vblank_s();
                     continue;
                 }
                 let t = VBLANKS.load(Ordering::Relaxed) as f64 / vblank_hz();
+                let r = super::relogio_vblank_s();
                 let sw = services::gsp::SWAPS[0].load(Ordering::Relaxed);
                 if sw != last_swaps {
-                    (last_swaps, last_t, dumps) = (sw, t, 0);
-                } else if t - last_t > 3.0 + dumps as f64 * 0.5 && dumps < 12 {
+                    (last_swaps, last_r, dumps) = (sw, r, 0);
+                } else if r - last_r > 3.0 + dumps as f64 * 0.5 && dumps < 12 {
                     dumps += 1;
                     eprintln!("[vigia] {t:.1}s sem quadro novo: {}", kernel::running_snapshot());
                     if dumps == 1 {

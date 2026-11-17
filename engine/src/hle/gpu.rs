@@ -163,6 +163,11 @@ pub fn submit_cmdlist(addr: u32, size: u32) {
 
 /// Lista já copiada da memória no despacho (GPU assíncrona).
 pub fn submit_cmdlist_words(addr: u32, size: u32, words: &[u32]) {
+    submit_cmdlist_words_etiq(addr, size, words, None);
+}
+
+/// Como `submit_cmdlist_words`, com as etiquetas de draw do jogo na faixa da lista (`hle/etiquetas.rs`).
+pub fn submit_cmdlist_words_etiq(addr: u32, size: u32, words: &[u32], et: Option<&super::etiquetas::EtiqLista>) {
     let mut g = GPU.lock().unwrap();
     g.cmdlists += 1;
     g.pending.push((addr, size));
@@ -170,7 +175,7 @@ pub fn submit_cmdlist_words(addr: u32, size: u32, words: &[u32]) {
         g.pending.remove(0);
     }
     drop(g);
-    crate::pica::execute_words(words);
+    crate::pica::execute_words_etiq(addr, words, et);
 }
 
 /// Preenche `[start, end)` com `value`; `control` bits 8/9 = 24/32 bits (senão 16).

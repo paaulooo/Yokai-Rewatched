@@ -1,0 +1,11 @@
+# Exemplo de mod de CÓDIGO. Para instalar: copie esta pasta para %APPDATA%/yw1/mods/registro_arquivos/ junto com
+# a DLL compilada (cargo build --release; copie target/release/registro_arquivos.dll para cá) e ligue o código no
+# menu (Esc/F1 → Configurações → Mods). Vale ao reiniciar.
+nome = "Registro de arquivos"
+versao = "0.1.0"
+autor = "yokai-port"
+prioridade = 0
+descricao = "Registra no log (game.log) cada arquivo que o jogo abre do yw1_a.fa. Não muda nada no jogo."
+
+[codigo]
+dll = "registro_arquivos.dll"

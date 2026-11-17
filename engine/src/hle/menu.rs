@@ -3,7 +3,9 @@
 //! Opções que ainda não existem no port aparecem desabilitadas com "(em breve)".
 
 use super::input::{key_name, pad_name};
-use super::settings::{Apresentacao, Botao, Controle, Filtro, Idioma, Layout, LimiteFps, PadLayout, Renderizacao, Renderizador, Settings, Teclado};
+use super::settings::{
+    Apresentacao, Botao, Controle, Filtro, Idioma, Layout, LimiteFps, PadLayout, Proporcao, Renderizacao, Renderizador, Settings, Teclado,
+};
 use egui::{Align2, RichText, Vec2};
 use winit::keyboard::KeyCode;
 
@@ -20,10 +22,11 @@ enum Secao {
     Teclado,
     Controle,
     Emulacao,
+    Mods,
 }
 
 impl Secao {
-    const ALL: [Secao; 5] = [Secao::Graficos, Secao::Som, Secao::Teclado, Secao::Controle, Secao::Emulacao];
+    const ALL: [Secao; 6] = [Secao::Graficos, Secao::Som, Secao::Teclado, Secao::Controle, Secao::Emulacao, Secao::Mods];
     fn nome(self) -> &'static str {
         match self {
             Secao::Graficos => "Gráficos",
@@ -31,6 +34,7 @@ impl Secao {
             Secao::Teclado => "Controles (teclado)",
             Secao::Controle => "Controle (gamepad)",
             Secao::Emulacao => "Emulação",
+            Secao::Mods => "Mods",
         }
     }
 }
@@ -67,6 +71,8 @@ pub struct Info {
     pub renderer_em_uso: Option<crate::render::Backend>,
     /// interpolação em uso (Hz; 0 = desligada) e taxa do monitor da janela (0 = desconhecida)
     pub interp: (u32, u32),
+    /// widescreen em efeito: tamanho da tela de cima na resolução interna (largura, altura); `None` = original
+    pub wide: Option<(u32, u32)>,
 }
 
 pub struct Menu {
@@ -74,11 +80,22 @@ pub struct Menu {
     pagina: Pagina,
     secao: Secao,
     pub captura: Option<Captura>,
+    /// mods listados na aba (os do boot; "procurar de novo" relê a pasta)
+    mods_vistos: Option<Vec<super::mods::indice::ModDesc>>,
+    /// mod cujo código o usuário quer ligar: esperando a confirmação do aviso
+    confirmar_codigo: Option<String>,
 }
 
 impl Default for Menu {
     fn default() -> Self {
-        Menu { open: false, pagina: Pagina::Principal, secao: Secao::Graficos, captura: None }
+        Menu {
+            open: false,
+            pagina: Pagina::Principal,
+            secao: Secao::Graficos,
+            captura: None,
+            mods_vistos: None,
+            confirmar_codigo: None,
+        }
     }
 }
 
@@ -96,7 +113,8 @@ impl Menu {
         let Some(Captura::Tecla(b, slot)) = self.captura else { return false };
         match key {
             KeyCode::Escape => {}
-            KeyCode::F1 | KeyCode::F11 => return true, // reservadas (menu / tela cheia): continua esperando
+            // reservadas (menu / ferramentas / tela cheia): continua esperando
+            KeyCode::F1 | KeyCode::F3 | KeyCode::F11 => return true,
             k => s.teclado.assign(b, slot, k),
         }
         self.captura = None;
@@ -199,6 +217,7 @@ impl Menu {
             Secao::Teclado => self.teclado(ui, &mut s.teclado),
             Secao::Controle => self.controle(ui, &mut s.controle, info),
             Secao::Emulacao => emulacao(ui, s),
+            Secao::Mods => self.mods(ui, s),
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -215,16 +234,158 @@ impl Menu {
                     Secao::Teclado => s.teclado = d.teclado,
                     Secao::Controle => s.controle = Controle::preset(s.controle.layout),
                     Secao::Emulacao => s.emulacao = d.emulacao,
+                    Secao::Mods => {
+                        s.mods = d.mods;
+                        self.confirmar_codigo = None;
+                    }
                 }
             }
         });
+    }
+
+    /// Aba "Mods": lista da pasta de mods, ligar/desligar, ordem e o código nativo (com aviso). Vale ao reiniciar.
+    fn mods(&mut self, ui: &mut egui::Ui, s: &mut Settings) {
+        use super::mods::{self, indice};
+        let est = mods::estado();
+        let lista = self
+            .mods_vistos
+            .get_or_insert_with(|| {
+                if est.mods.is_empty() {
+                    mods::descobrir_de_novo()
+                } else {
+                    est.mods.iter().map(|m| m.desc.clone()).collect()
+                }
+            })
+            .clone();
+        let pasta = mods::pasta();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pasta:");
+            ui.label(RichText::new(pasta.display().to_string()).monospace());
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Abrir a pasta").clicked() {
+                let _ = std::fs::create_dir_all(&pasta);
+                #[cfg(windows)]
+                let _ = std::process::Command::new("explorer").arg(&pasta).spawn();
+            }
+            if ui.button("Procurar de novo").clicked() {
+                self.mods_vistos = Some(mods::descobrir_de_novo());
+            }
+        });
+        if est.desligado_pelo_ambiente {
+            ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "YW_MODS=0 (ambiente): nenhum mod vale nesta execução.");
+        }
+        ui.label(
+            RichText::new(
+                "Mudanças valem ao reiniciar o jogo. Cada mod é uma pasta com mod.toml; romfs/<caminho do .fa> troca o \
+                 arquivo do jogo. Quando dois mods trocam o mesmo arquivo, vale o de cima.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+        if lista.is_empty() {
+            ui.label("Nenhum mod na pasta.");
+            return;
+        }
+        let ordem = indice::ordem_efetiva(&lista, &s.mods);
+        let ids: Vec<String> = ordem.iter().map(|&i| lista[i].id.clone()).collect();
+        let mut mover: Option<(usize, usize)> = None;
+        let vermelho = egui::Color32::from_rgb(230, 90, 80);
+        for (pos, &i) in ordem.iter().enumerate() {
+            let m = &lista[i];
+            let sit = est.mods.iter().find(|x| x.desc.id == m.id);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(pos > 0, egui::Button::new("↑").small()).on_hover_text("subir (vence os de baixo)").clicked() {
+                    mover = Some((pos, pos - 1));
+                }
+                if ui.add_enabled(pos + 1 < ordem.len(), egui::Button::new("↓").small()).on_hover_text("descer").clicked() {
+                    mover = Some((pos, pos + 1));
+                }
+                let mut on = !s.mods.desligados.contains(&m.id);
+                let titulo = if m.versao.is_empty() { m.nome.clone() } else { format!("{} {}", m.nome, m.versao) };
+                if ui.add_enabled(m.erro.is_none(), egui::Checkbox::new(&mut on, RichText::new(titulo).strong())).changed() {
+                    s.mods.desligados.retain(|d| d != &m.id);
+                    if !on {
+                        s.mods.desligados.push(m.id.clone());
+                    }
+                }
+                if !m.autor.is_empty() {
+                    ui.label(RichText::new(format!("por {}", m.autor)).weak());
+                }
+            });
+            ui.indent(("yw_mod", m.id.as_str()), |ui| {
+                if !m.descricao.is_empty() {
+                    ui.label(RichText::new(m.descricao.as_str()).small());
+                }
+                if let Some(e) = &m.erro {
+                    ui.colored_label(vermelho, format!("ignorado: {e}"));
+                }
+                let mut det = format!("pasta {} · prioridade {} · {} arquivos", m.id, m.prioridade, m.arquivos.len());
+                match sit {
+                    Some(x) => det += &format!(" ({} valendo nesta execução)", x.arquivos_valendo),
+                    None => det += " (achado depois do início: vale ao reiniciar)",
+                }
+                ui.label(RichText::new(det).weak().small());
+                for a in &m.avisos {
+                    ui.label(RichText::new(format!("aviso: {a}")).weak().small());
+                }
+                if let Some(dll) = &m.dll {
+                    let mut cod = s.mods.codigo_ligado.contains(&m.id);
+                    let nome_dll = dll.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let r = ui.add_enabled(m.erro.is_none(), egui::Checkbox::new(&mut cod, format!("Código nativo ({nome_dll})")));
+                    if r.changed() {
+                        if cod {
+                            // não liga direto: pede a confirmação do aviso abaixo
+                            self.confirmar_codigo = Some(m.id.clone());
+                        } else {
+                            s.mods.codigo_ligado.retain(|d| d != &m.id);
+                            self.confirmar_codigo = None;
+                        }
+                    }
+                    match sit.and_then(|x| x.codigo.as_ref()) {
+                        Some(Ok(n)) => ui.label(RichText::new(format!("código carregado nesta execução ({n} ganchos)")).weak().small()),
+                        Some(Err(e)) => ui.colored_label(vermelho, format!("código recusado: {e}")),
+                        None => ui.label(RichText::new("código não carregado nesta execução").weak().small()),
+                    };
+                    if self.confirmar_codigo.as_deref() == Some(m.id.as_str()) {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 170, 60),
+                                "Atenção: um mod de código é um programa (DLL) que roda dentro do jogo com confiança \
+                                 total — pode ler e mudar qualquer coisa no seu PC, como qualquer programa. Só ligue \
+                                 se você confia em quem fez o mod.",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Ligar o código mesmo assim").clicked() {
+                                    if !s.mods.codigo_ligado.contains(&m.id) {
+                                        s.mods.codigo_ligado.push(m.id.clone());
+                                    }
+                                    self.confirmar_codigo = None;
+                                }
+                                if ui.button("Cancelar").clicked() {
+                                    self.confirmar_codigo = None;
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some((a, b)) = mover {
+            let mut v = ids;
+            v.swap(a, b);
+            s.mods.ordem = v;
+        }
     }
 
     fn teclado(&mut self, ui: &mut egui::Ui, t: &mut Teclado) {
         ui.label(
             RichText::new(
                 "Clique numa tecla e aperte a nova (botão direito remove; + acrescenta). Esc ou clicar de \
-                 novo cancela. Esc, F1 (menu) e F11 (tela cheia) não podem ser usadas.",
+                 novo cancela. Esc, F1 (menu), F3 (ferramentas) e F11 (tela cheia) não podem ser usadas. \
+                 Turbo: enquanto segurada, o jogo anda mais rápido (Emulação → Turbo).",
             )
             .weak(),
         );
@@ -414,6 +575,18 @@ fn graficos(ui: &mut egui::Ui, s: &mut Settings, info: &Info) {
         .weak()
         .small(),
     );
+    combo(ui, "Proporção da tela de cima", &mut g.proporcao, &Proporcao::ALL, Proporcao::nome);
+    ui.checkbox(&mut g.hud_ancorada, "HUD ancorada nas bordas (widescreen)");
+    ui.label(
+        RichText::new(
+            "Widescreen: o jogo passa a enxergar uma cena mais larga (nada é esticado e o que fica nas bordas não              some); a HUD fica no retângulo 5:3 do meio e os fades/filtros de tela cheia cobrem a largura toda.              \"Seguir a janela\" usa a proporção da área da tela de cima no layout escolhido. A tela de baixo não              muda. Vale na hora; YW_ASPECT (ambiente) manda por cima. Só no renderizador Vulkan.",
+        )
+        .weak()
+        .small(),
+    );
+    if let Some((w, h)) = info.wide {
+        ui.label(RichText::new(format!("Em uso: tela de cima {w}×{h} na resolução interna ({:.3}:1)", w as f32 / h as f32)).small());
+    }
     ui.horizontal(|ui| {
         ui.label("Interpolação de quadros:");
         for (hz, nome) in [(0u32, "desligada"), (60, "60"), (90, "90"), (120, "120"), (144, "144"), (180, "180")] {
@@ -501,10 +674,30 @@ fn som(ui: &mut egui::Ui, s: &mut Settings) {
 }
 
 fn emulacao(ui: &mut egui::Ui, s: &mut Settings) {
+    emulacao_base(ui, s);
+    ui.add_space(6.0);
+    ui.checkbox(&mut s.dev.ferramentas, "Ferramentas de desenvolvedor (F3 no jogo)");
+    ui.label(
+        RichText::new("ganchos, memória, arquivos abertos, câmera e desempenho; YW_DEV=1/0 vence esta opção")
+            .weak()
+            .small(),
+    );
+}
+
+fn emulacao_base(ui: &mut egui::Ui, s: &mut Settings) {
     combo(ui, "Idioma do console", &mut s.emulacao.idioma, &Idioma::ALL, Idioma::nome);
     ui.label(RichText::new("vale ao reiniciar o jogo (o cartucho americano tem inglês, francês e espanhol)").weak().small());
     ui.add_space(6.0);
-    ui.label("Velocidade: normal (travada, como no 3DS)");
+    ui.label("Velocidade: normal (como no 3DS); o turbo só vale enquanto a tecla/botão dele é segurado");
+    ui.add(egui::Slider::new(&mut s.emulacao.turbo, 2..=4).text("Turbo (segurar)").suffix("×"));
+    ui.label(
+        RichText::new(
+            "Turbo: Tab no teclado / clique do analógico direito no controle (remapeáveis). O som fica mudo e a \
+             interpolação de quadros pausa enquanto ele está ligado; ao soltar, volta ao normal no quadro seguinte.",
+        )
+        .weak()
+        .small(),
+    );
     ui.label(
         RichText::new(
             "Com este menu aberto o jogo fica pausado: VBlank, som, relógio do sistema e timers param.",

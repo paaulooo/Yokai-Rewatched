@@ -43,6 +43,8 @@ pub(super) enum ShadowSrc {
 pub(super) struct Shadow {
     pub img: Img,
     pub n: u32,
+    /// altura da imagem (linhas do alvo = horizontal da tela de cima): `h·n`, ou a largura do widescreen (G3)
+    pub h: u32,
     pub src: Option<ShadowSrc>,
     /// geração de escrita: sobe a cada draw gravado na sombra e a cada recarga. A apresentação em dois passos confere
     /// que nada mudou a sombra entre `present_check` e `present_finish`.
@@ -60,6 +62,8 @@ pub(super) struct ReplayTarget {
     pub cimage: vk::Image,
     pub dimage: vk::Image,
     pub n: u32,
+    /// altura das imagens (como `Shadow::h`)
+    pub h: u32,
 }
 
 /// Imagem final de uma tela na resolução interna (RGBA8, linhas de cima para baixo).
@@ -332,6 +336,9 @@ pub(super) struct Hr {
     pub on: bool,
     pub scale: u32,
     pub fxaa: bool,
+    /// altura da sombra dos alvos de 400 linhas (a horizontal da tela de cima): `400·scale`, ou mais (menos) com o
+    /// widescreen (G3, `render::wide_px`)
+    pub wide: u32,
     pub ready: bool,
     lin: vk::Sampler,
     near: vk::Sampler,
@@ -375,27 +382,37 @@ pub(super) fn shadow_eligible(ck: SurfKey) -> bool {
 
 /// Replica cada pixel (de `bpp` bytes) N×N: `src` w×h → `dst` (w·n)×(h·n). Só ESCREVE em `dst` (o anel de upload pode
 /// ser memória sem cache, onde ler é caro): a linha replicada é montada num buffer local e escrita N vezes.
+#[cfg(test)]
 fn expand(src: &[u8], w: usize, h: usize, n: usize, bpp: usize, dst: &mut [u8]) {
+    expand_to(src, w, h, n, h * n, bpp, dst)
+}
+
+/// Como `expand`, com `hs` linhas no destino (widescreen: a linha de destino y vem da linha `y·h/hs`, vizinho mais
+/// próximo; com `hs = h·n` é exatamente `expand`).
+fn expand_to(src: &[u8], w: usize, h: usize, n: usize, hs: usize, bpp: usize, dst: &mut [u8]) {
     let row = w * n * bpp;
     let mut line = vec![0u8; row];
-    for y in 0..h {
-        for x in 0..w {
-            let p = &src[(y * w + x) * bpp..(y * w + x) * bpp + bpp];
-            for k in 0..n {
-                let o = (x * n + k) * bpp;
-                line[o..o + bpp].copy_from_slice(p);
+    let mut cur = usize::MAX;
+    for dy in 0..hs {
+        let y = dy * h / hs;
+        if y != cur {
+            cur = y;
+            for x in 0..w {
+                let p = &src[(y * w + x) * bpp..(y * w + x) * bpp + bpp];
+                for k in 0..n {
+                    let o = (x * n + k) * bpp;
+                    line[o..o + bpp].copy_from_slice(p);
+                }
             }
         }
-        for k in 0..n {
-            let o = (y * n + k) * row;
-            dst[o..o + row].copy_from_slice(&line);
-        }
+        let o = dy * row;
+        dst[o..o + row].copy_from_slice(&line);
     }
 }
 
-/// Regiões de cópia buffer → sombra (como `copy_regions`, em N×).
-fn copy_regions_n(k: SurfKey, off: u64, n: u32) -> Vec<vk::BufferImageCopy> {
-    let (w, h) = (k.w * n, k.h * n);
+/// Regiões de cópia buffer → sombra (como `copy_regions`, em N×; `hs` = altura da sombra).
+fn copy_regions_n(k: SurfKey, off: u64, n: u32, hs: u32) -> Vec<vk::BufferImageCopy> {
+    let (w, h) = (k.w * n, hs);
     let ext = vk::Extent3D { width: w, height: h, depth: 1 };
     let reg = |o: u64, a: vk::ImageAspectFlags| vk::BufferImageCopy {
         buffer_offset: o,
@@ -413,6 +430,15 @@ fn copy_regions_n(k: SurfKey, off: u64, n: u32) -> Vec<vk::BufferImageCopy> {
 }
 
 impl Vk {
+    /// Altura da sombra de um alvo de `h` linhas: a do widescreen para os de 400 (a tela de cima), senão `h·N`.
+    pub(super) fn shadow_h_for(&self, h: u32) -> u32 {
+        if h == 400 && self.hr.wide != 0 {
+            self.hr.wide
+        } else {
+            h * self.hr.scale
+        }
+    }
+
     /// Pipelines de computação e samplers (uma vez).
     pub(super) unsafe fn hr_init(&mut self) -> Result<(), String> {
         if self.hr.ready {
@@ -453,7 +479,7 @@ impl Vk {
             );
             Ok((dsl, l))
         };
-        let (p_dsl, p_layout) = mk_layout(vk::DescriptorType::STORAGE_BUFFER, 28)?;
+        let (p_dsl, p_layout) = mk_layout(vk::DescriptorType::STORAGE_BUFFER, 36)?;
         let (a_dsl, a_layout) = mk_layout(vk::DescriptorType::STORAGE_IMAGE, 8)?;
         let pipe = |spv: &[u8], layout: vk::PipelineLayout| -> Result<vk::Pipeline, String> {
             let words = ash::util::read_spv(&mut std::io::Cursor::new(spv)).map_err(|e| e.to_string())?;
@@ -498,9 +524,10 @@ impl Vk {
                     vk::ImageAspectFlags::COLOR,
                 )
             };
-            let img = self.image(k.w * n, k.h * n, fmt, usage, aspect)?;
+            let hs = self.shadow_h_for(k.h);
+            let img = self.image(k.w * n, hs, fmt, usage, aspect)?;
             self.init_layout(img.image, aspect);
-            self.surfaces.get_mut(&k).ok_or("sombra: superfície sumiu")?.shadow = Some(Shadow { img, n, src: Some(ShadowSrc::Memory), wgen: 0 });
+            self.surfaces.get_mut(&k).ok_or("sombra: superfície sumiu")?.shadow = Some(Shadow { img, n, h: hs, src: Some(ShadowSrc::Memory), wgen: 0 });
         }
         let s = self.surfaces.get_mut(&k).ok_or("sombra: superfície sumiu")?;
         let sh = s.shadow.as_mut().unwrap();
@@ -518,10 +545,10 @@ impl Vk {
 
     /// Põe na sombra o conteúdo que o alvo nativo recebeu (clear ou memória decodificada e replicada N×N).
     unsafe fn shadow_init(&mut self, k: SurfKey, src: ShadowSrc) -> Result<(), String> {
-        let (image, n) = {
+        let (image, n, hs) = {
             let sh = self.surfaces.get_mut(&k).unwrap().shadow.as_mut().unwrap();
             sh.wgen += 1;
-            (sh.img.image, sh.n)
+            (sh.img.image, sh.n, sh.h)
         };
         let clear = |me: &Vk, c: Clear| match c {
             Clear::Color(rgba) => me.device.cmd_clear_color_image(
@@ -554,15 +581,15 @@ impl Vk {
                 let mut small = vec![0u8; npx * planes];
                 decode_surface(k, mem, &mut small);
                 let nn = n as usize;
-                let big = npx * nn * nn;
+                let big = w * nn * hs as usize;
                 let bytes = (big * planes) as u64;
                 let off = self.ring_alloc(bytes).ok_or("anel de upload cheio (sombra)")?;
                 let dst = std::slice::from_raw_parts_mut(self.ring.ptr.add(off as usize), bytes as usize);
-                expand(&small[..4 * npx], w, h, nn, 4, &mut dst[..4 * big]);
+                expand_to(&small[..4 * npx], w, h, nn, hs as usize, 4, &mut dst[..4 * big]);
                 if k.depth {
-                    expand(&small[4 * npx..], w, h, nn, 1, &mut dst[4 * big..]);
+                    expand_to(&small[4 * npx..], w, h, nn, hs as usize, 1, &mut dst[4 * big..]);
                 }
-                self.device.cmd_copy_buffer_to_image(self.cmd_pre, self.ring.buf, image, vk::ImageLayout::GENERAL, &copy_regions_n(k, off, n));
+                self.device.cmd_copy_buffer_to_image(self.cmd_pre, self.ring.buf, image, vk::ImageLayout::GENERAL, &copy_regions_n(k, off, n, hs));
             }
         }
         Ok(())
@@ -571,7 +598,9 @@ impl Vk {
     /// Configuração (sombra ligada, N, FXAA) mudou? Então executa o lote, devolve tudo à memória e descarta as sombras.
     pub(super) unsafe fn hires_sync_config(&mut self) -> Result<(), String> {
         let (on, scale, fxaa) = (super::super::hires_on(), super::super::scale(), super::super::fxaa());
-        if (on, scale, fxaa) == (self.hr.on, self.hr.scale, self.hr.fxaa) {
+        // widescreen (G3): a largura da sombra da tela de cima muda com a proporção (ao vivo: refaz as sombras)
+        let wide = super::super::wide_px(scale);
+        if (on, scale, fxaa, wide) == (self.hr.on, self.hr.scale, self.hr.fxaa, self.hr.wide) {
             return Ok(());
         }
         self.flush()?;
@@ -581,13 +610,22 @@ impl Vk {
         }
         let had = self.hr.on;
         self.hires_drop_all();
+        let wide_antes = self.hr.wide;
         self.hr.on = on;
         self.hr.scale = scale;
         self.hr.fxaa = fxaa;
+        self.hr.wide = wide;
         if on {
             self.hr_init()?;
             if !had || scale > 1 {
                 eprintln!("[vulkan] resolução interna {scale}× (sombra dos alvos de tela){}", if fxaa { " + FXAA de cena" } else { "" });
+            }
+            if wide != 400 * scale || (wide_antes != 0 && wide_antes != 400 * scale) {
+                eprintln!(
+                    "[vulkan] widescreen: tela de cima com {wide}×{} na sombra (proporção {:.3})",
+                    240 * scale,
+                    wide as f32 / (240 * scale) as f32
+                );
             }
         }
         Ok(())
@@ -639,20 +677,20 @@ impl Vk {
         self.record_fxaa(cs, ck)
     }
 
-    /// Imagem, vista e fator da sombra de `ck` (ou do alvo de re-renderização, se `ck` é a chave dele).
-    pub(super) fn shadow_img(&self, ck: SurfKey) -> Option<(vk::Image, vk::ImageView, u32)> {
+    /// Imagem, vista, fator e altura da sombra de `ck` (ou do alvo de re-renderização, se `ck` é a chave dele).
+    pub(super) fn shadow_img(&self, ck: SurfKey) -> Option<(vk::Image, vk::ImageView, u32, u32)> {
         if let Some(r) = &self.replay {
             if r.ck == ck {
-                return Some((r.cimage, r.cview, r.n));
+                return Some((r.cimage, r.cview, r.n, r.h));
             }
         }
-        self.surfaces.get(&ck).and_then(|s| s.shadow.as_ref()).map(|sh| (sh.img.image, sh.img.view, sh.n))
+        self.surfaces.get(&ck).and_then(|s| s.shadow.as_ref()).map(|sh| (sh.img.image, sh.img.view, sh.n, sh.h))
     }
 
     /// FXAA sobre a sombra de `ck` (cópia → compute → de volta). `cb` precisa estar gravando, fora de passada.
     unsafe fn record_fxaa(&mut self, cb: vk::CommandBuffer, ck: SurfKey) -> Result<(), String> {
-        let (image, view, n) = self.shadow_img(ck).ok_or("FXAA: sem sombra")?;
-        let (w, h) = (ck.w * n, ck.h * n);
+        let (image, view, n, hs) = self.shadow_img(ck).ok_or("FXAA: sem sombra")?;
+        let (w, h) = (ck.w * n, hs);
         if self.hr.tmp.as_ref().is_none_or(|t| (t.0, t.1) != (w, h)) {
             if let Some((_, _, old)) = self.hr.tmp.take() {
                 // pode ainda estar em uso por comandos já gravados neste lote ou em voo
@@ -905,8 +943,7 @@ impl Vk {
     /// (`use_value`: o de `cb`). Nada de mexer na memória guest (nem ler: `hash` é o do framebuffer nativo, calculado em
     /// `present_check`).
     pub(super) unsafe fn present_record(&mut self, cb: vk::CommandBuffer, req: PresentReq, aa_key: SurfKey, hash: u64) -> Result<OutRef, String> {
-        let n = self.hr.scale;
-        let (fw, fh) = (req.hh * n, req.ow * n);
+        let (fw, fh, _) = self.present_dims(req, aa_key);
         let bytes = fw as u64 * fh as u64 * 4;
         let (slot, ptr) = self.out_acquire(bytes)?;
         let o = OutRef { slot, ptr, len: bytes as usize, w: fw, h: fh, hash, bytes: req.out_bytes, value: self.use_value() };
@@ -917,9 +954,19 @@ impl Vk {
         Ok(o)
     }
 
+    /// (largura, altura) da imagem final e altura da imagem de origem (linhas do alvo, em N×). Sem widescreen:
+    /// (400N, 240N, ih·N). Com ele, a largura sai da altura da sombra (redução `sy` dela).
+    fn present_dims(&self, req: PresentReq, aa_key: SurfKey) -> (u32, u32, u32) {
+        let n = self.hr.scale;
+        match self.shadow_img(aa_key) {
+            Some((_, _, _, hs)) if hs != req.ih * n && req.sy > 0 => (hs / req.sy, req.ow * n, hs),
+            _ => (req.hh * n, req.ow * n, req.ih * n),
+        }
+    }
+
     unsafe fn present_record_in(&mut self, cb: vk::CommandBuffer, req: PresentReq, aa_key: SurfKey, slot: usize, bytes: u64) -> Result<(), String> {
         let n = self.hr.scale;
-        let (fw, fh) = (req.hh * n, req.ow * n);
+        let (fw, fh, ihn) = self.present_dims(req, aa_key);
         let out_buf = self.hr.outs.bufs[slot].buf;
         let d = self.device.clone();
         // FXAA pendente (cena sem interface depois)
@@ -927,7 +974,7 @@ impl Vk {
             self.hr.aa.get_mut(&aa_key).unwrap().1 = true;
             self.record_fxaa(cb, aa_key)?;
         }
-        let (_, view, _) = self.shadow_img(aa_key).ok_or("present: sem imagem")?;
+        let (_, view, _, _) = self.shadow_img(aa_key).ok_or("present: sem imagem")?;
         let si = [vk::DescriptorImageInfo { sampler: self.hr.near, image_view: view, image_layout: vk::ImageLayout::GENERAL }];
         let bi = [vk::DescriptorBufferInfo { buffer: out_buf, offset: 0, range: bytes }];
         d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.hr.p_pipe);
@@ -941,8 +988,8 @@ impl Vk {
                 vk::WriteDescriptorSet::default().dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi),
             ],
         );
-        let pc: [u32; 7] = [n, req.sx, req.sy, req.flip as u32, req.ih, req.ow, req.hh];
-        d.cmd_push_constants(cb, self.hr.p_layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(pc.as_ptr() as *const u8, 28));
+        let pc: [u32; 9] = [n, req.sx, req.sy, req.flip as u32, req.ih, req.ow, req.hh, fw, ihn];
+        d.cmd_push_constants(cb, self.hr.p_layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(pc.as_ptr() as *const u8, 36));
         self.full_barrier(cb);
         d.cmd_dispatch(cb, fw.div_ceil(8), fh.div_ceil(8), 1);
         self.mem_barrier(
@@ -1023,6 +1070,49 @@ mod testes {
                     }
                     assert_eq!(got, want, "{w}x{h} bpp {bpp} n {n}");
                 }
+            }
+        }
+    }
+
+    /// Widescreen: mapeamento y de cada classe de draw na sombra larga (e nenhum sem widescreen).
+    #[test]
+    fn larga_ymap_por_classe() {
+        use crate::render::{LARGA_2D, LARGA_CENA, LARGA_CHEIA, LARGA_NADA};
+        // sem widescreen: o caminho de sempre
+        assert_eq!(larga_ymap(LARGA_CENA, true, 400, 3, 1200, 0.0), None);
+        // 16:9 a 3× (1280 linhas): cena e tela cheia esticam; 2D no meio
+        assert_eq!(larga_ymap(LARGA_CENA, true, 400, 3, 1280, 0.0), Some((3.2, 0.0)));
+        assert_eq!(larga_ymap(LARGA_CHEIA, false, 400, 3, 1280, 0.0), Some((3.2, 0.0)));
+        assert_eq!(larga_ymap(LARGA_2D, true, 400, 3, 1280, 0.0), Some((3.0, 40.0)));
+        // sem classe: pelo teste de profundidade
+        assert_eq!(larga_ymap(LARGA_NADA, true, 400, 1, 427, 0.0), Some((427.0 / 400.0, 0.0)));
+        assert_eq!(larga_ymap(LARGA_NADA, false, 400, 1, 427, 0.0), Some((1.0, 13.5)));
+        // âncora da G5: encostado num lado ou no outro
+        assert_eq!(larga_ymap(LARGA_2D, false, 400, 1, 560, -1.0), Some((1.0, 0.0)));
+        assert_eq!(larga_ymap(LARGA_2D, false, 400, 1, 560, 1.0), Some((1.0, 160.0)));
+        // mais estreita que 5:3 (16:10): o 2D é comprimido junto para caber
+        assert_eq!(larga_ymap(LARGA_2D, false, 400, 1, 384, 0.0), Some((0.96, 0.0)));
+    }
+
+    /// `expand_to` com `hs = h·n` = `expand`; com outra altura, cada linha de destino vem da linha `y·h/hs`.
+    #[test]
+    fn expand_to_estica_as_linhas() {
+        let (w, h, n) = (3usize, 4usize, 2usize);
+        let src: Vec<u8> = (0..w * h * 4).map(|i| i as u8).collect();
+        let mut a = vec![0u8; w * n * h * n * 4];
+        let mut b = a.clone();
+        expand(&src, w, h, n, 4, &mut a);
+        expand_to(&src, w, h, n, h * n, 4, &mut b);
+        assert_eq!(a, b);
+        let hs = 11usize;
+        let mut c = vec![0u8; w * n * hs * 4];
+        expand_to(&src, w, h, n, hs, 4, &mut c);
+        for dy in 0..hs {
+            let y = dy * h / hs;
+            for x in 0..w * n {
+                let o = (dy * w * n + x) * 4;
+                let si = (y * w + x / n) * 4;
+                assert_eq!(&c[o..o + 4], &src[si..si + 4], "linha {dy} coluna {x}");
             }
         }
     }

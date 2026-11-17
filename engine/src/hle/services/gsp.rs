@@ -240,8 +240,9 @@ pub fn request(ipc: &Ipc) {
 #[derive(Clone, Debug)]
 enum GxCmd {
     Dma(u32, u32, u32),
-    /// endereço, tamanho e as palavras copiadas no despacho
-    List(u32, u32, Vec<u32>),
+    /// endereço, tamanho, as palavras copiadas no despacho e as etiquetas de draw do jogo na faixa (G1,
+    /// `hle/etiquetas.rs`): viajam com a lista até a thread "gpu", sem estado compartilhado entre as threads
+    List(u32, u32, Vec<u32>, Option<std::sync::Arc<crate::hle::etiquetas::EtiqLista>>),
     Fill([u32; 7]),
     Transfer([u32; 5]),
     Copy([u32; 6]),
@@ -267,8 +268,8 @@ fn run_gx(c: GxCmd) -> (&'static [u8], Post) {
             }
             (&[DMA], None)
         }
-        GxCmd::List(a, n, words) => {
-            gpu::submit_cmdlist_words(a, n, &words);
+        GxCmd::List(a, n, words, et) => {
+            gpu::submit_cmdlist_words_etiq(a, n, &words, et.as_deref());
             (&[P3D], None)
         }
         GxCmd::Fill(p) => {
@@ -413,7 +414,7 @@ fn process_queue() {
         let p = |i: u32| r32(cmd + 4 + 4 * i);
         let c = match id {
             0x00 => Some(GxCmd::Dma(p(0), p(1), p(2))),
-            0x01 => Some(GxCmd::List(p(0), p(1), crate::pica::read_list(p(0), p(1)))),
+            0x01 => Some(GxCmd::List(p(0), p(1), crate::pica::read_list(p(0), p(1)), crate::hle::etiquetas::extrair(p(0), p(1)))),
             0x02 => Some(GxCmd::Fill([p(0), p(1), p(2), p(3), p(4), p(5), p(6)])),
             0x03 => Some(GxCmd::Transfer([p(0), p(1), p(2), p(3), p(4)])),
             0x04 => Some(GxCmd::Copy([p(0), p(1), p(2), p(3), p(4), p(5)])),

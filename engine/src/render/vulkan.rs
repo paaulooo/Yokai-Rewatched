@@ -973,6 +973,31 @@ pub fn set_fastz(on: bool) {
     FASTZ.store(on as u8, Ordering::Relaxed);
 }
 
+/// Widescreen (G3): mapeamento do eixo y do alvo (linhas = horizontal da tela de cima) na sombra de altura `hs`
+/// (`hires.rs`), como (ky, oy): y_sombra = y·ky + oy. `None` = sombra sem widescreen (`hs = h·N`: o caminho de sempre,
+/// bit a bit). Cena (`LARGA_CENA`) e 2D de tela cheia (`LARGA_CHEIA`) esticam para a largura inteira; o 2D
+/// (`LARGA_2D`) fica no retângulo 5:3 central (ky = N), a não ser que a sombra seja MAIS ESTREITA que 400·N (proporção
+/// < 5:3: aí tudo é comprimido para caber). Sem classe (`LARGA_NADA`): pelo teste de profundidade.
+///
+/// `ancora` (G5, HUD ancorada: `Ctx::ancora`, decidida em `hle/hud.rs`): onde o retângulo de 400·N fica dentro da
+/// largura nova, de −1 (encostado nas linhas de y menor do alvo) a +1 (nas de y maior); 0 = centro (G3). Conferido
+/// numa captura a 21:9 com todo o 2D forçado em −1: o y menor do alvo é a ESQUERDA da tela de cima.
+pub(super) fn larga_ymap(larga: u8, dtest: bool, h: u32, n: u32, hs: u32, ancora: f32) -> Option<(f32, f32)> {
+    if hs == h * n || h == 0 {
+        return None;
+    }
+    let estica = match larga {
+        super::LARGA_CENA | super::LARGA_CHEIA => true,
+        super::LARGA_2D => false,
+        _ => dtest,
+    };
+    if estica || hs < h * n {
+        Some((hs as f32 / h as f32, 0.0))
+    } else {
+        Some((n as f32, (hs - h * n) as f32 / 2.0 * (1.0 + ancora.clamp(-1.0, 1.0))))
+    }
+}
+
 /// Faixa do viewport (min_depth, max_depth) de um draw com o fragmento `pica_frag_fastz`, ou None se ele tem de
 /// ficar com o gl_FragDepth exato.
 ///
@@ -1505,7 +1530,7 @@ impl Vk {
             "vkCreateDescriptorSetLayout"
         );
         let dsls = [dsl];
-        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::FRAGMENT, offset: 0, size: 4 }];
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::FRAGMENT, offset: 0, size: 12 }];
         let playout = vkr!(
             device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&dsls).push_constant_ranges(&pcr), None),
             "vkCreatePipelineLayout"
@@ -1734,7 +1759,7 @@ impl Vk {
             "vkCreateDescriptorSetLayout(vs)"
         );
         let dsls = [self.dsl, dsl];
-        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::FRAGMENT, offset: 0, size: 4 }];
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::FRAGMENT, offset: 0, size: 12 }];
         let playout = vkr!(
             d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&dsls).push_constant_ranges(&pcr), None),
             "vkCreatePipelineLayout(vs)"
@@ -2507,7 +2532,11 @@ impl Vk {
         // estêncil), mais o alinhamento de 16 de cada reserva. Uma margem fixa (antes: 20 MB) ficava abaixo disso.
         let ring_need: u64 = texs.iter().map(|(_, t)| t.w as u64 * t.h as u64 * 4 + 16).sum::<u64>()
             + w as u64 * h as u64 * (4 + 5)
-            + if replay.is_none() && self.hr.on && shadow_eligible(ck) { w as u64 * h as u64 * (4 + 5) * (self.hr.scale as u64).pow(2) } else { 0 }
+            + if replay.is_none() && self.hr.on && shadow_eligible(ck) {
+                (w * self.hr.scale) as u64 * self.shadow_h_for(h) as u64 * (4 + 5)
+            } else {
+                0
+            }
             + 32;
         if ring_need > self.ring.size {
             self.grow_ring(ring_need)?;
@@ -2685,7 +2714,8 @@ impl Vk {
                 // as versões (chaves) das texturas que este draw usou: o replay usa exatamente essas, e o conteúdo
                 // delas entra na identidade do desenho (vídeo, textura animada ou renderizada muda de um quadro para o
                 // outro e tira o desenho do pareamento)
-                if self.ip.record(ctx, key, aot, dr, tex_keys) {
+                // etiqueta do jogo deste draw (G1, `hle/etiquetas.rs`): o pareamento da interpolação por identidade
+                if self.ip.record(ctx, key, aot, dr, tex_keys, crate::hle::etiquetas::draw_atual()) {
                     self.tex_pinned.extend(tex_keys.iter().flatten().copied());
                 }
             }
@@ -2742,7 +2772,11 @@ impl Vk {
                         }
                     }
                 }
-                self.begin_pass(cs, scv, sdv, w * n, h * n, dl, dclear);
+                let hs = match replay {
+                    Some(r) => r.h,
+                    None => self.shadow_h_for(h),
+                };
+                self.begin_pass(cs, scv, sdv, w * n, hs, dl, dclear);
                 self.pass_s = Some((ck, dk));
             }
         }
@@ -2850,6 +2884,13 @@ impl Vk {
         if shadow_views.is_some() {
             targets.push((self.cmd_shadow, self.hr.scale, false));
         }
+        // widescreen (G3): na sombra mais larga que 400·N, o eixo y do alvo (= horizontal da tela de cima) vai para
+        // y·ky + oy: cena e 2D de tela cheia esticam (ky = largura/400), o 2D fica no retângulo 5:3 central (ky = N)
+        let shadow_hs = match replay {
+            Some(r) => r.h,
+            None => self.shadow_h_for(h),
+        };
+        let ymap = if shadow_views.is_some() { larga_ymap(ctx.larga, key.dtest, h, self.hr.scale, shadow_hs, ctx.ancora) } else { None };
         let prof_meta = |ns: u32| super::drawprof::Meta {
             ns,
             w,
@@ -2882,19 +2923,34 @@ impl Vk {
                 Some(r) if !native => r,
                 _ => (viewport.min_depth, viewport.max_depth),
             };
-            d.cmd_set_viewport(
-                cb,
-                0,
-                &[vk::Viewport { x: viewport.x * f, y: viewport.y * f, width: viewport.width * f, height: viewport.height * f, min_depth, max_depth }],
-            );
+            let ym = if native { None } else { ymap };
+            let (vy, vh, sy0, sy1) = match ym {
+                None => (viewport.y * f, viewport.height * f, y0 * ns, y1 * ns),
+                Some((ky, oy)) => (
+                    viewport.y * ky + oy,
+                    viewport.height * ky,
+                    (y0 as f32 * ky + oy).floor().max(0.0) as u32,
+                    ((y1 as f32 * ky + oy).ceil() as u32).min(shadow_hs),
+                ),
+            };
+            if sy1 <= sy0 {
+                continue;
+            }
+            d.cmd_set_viewport(cb, 0, &[vk::Viewport { x: viewport.x * f, y: vy, width: viewport.width * f, height: vh, min_depth, max_depth }]);
             d.cmd_set_scissor(
                 cb,
                 0,
                 &[vk::Rect2D {
-                    offset: vk::Offset2D { x: (x0 * ns) as i32, y: (y0 * ns) as i32 },
-                    extent: vk::Extent2D { width: (x1 - x0) * ns, height: (y1 - y0) * ns },
+                    offset: vk::Offset2D { x: (x0 * ns) as i32, y: sy0 as i32 },
+                    extent: vk::Extent2D { width: (x1 - x0) * ns, height: sy1 - sy0 },
                 }],
             );
+            // push constant do fragmento: fator N e, com widescreen, o mapeamento y (scissor de exclusão)
+            let pcf: [u32; 3] = match ym {
+                None => [ns, 0, 0],
+                Some((ky, oy)) => [ns, ky.to_bits(), oy.to_bits()],
+            };
+            let pcb = std::slice::from_raw_parts(pcf.as_ptr() as *const u8, 12);
             d.cmd_set_blend_constants(cb, &ctx.blend_color.map(|c| c as f32 / 255.0));
             let (_, _, st_wmask, st_ref, st_imask, _) = ctx.stencil;
             let ff = vk::StencilFaceFlags::FRONT_AND_BACK;
@@ -2909,7 +2965,7 @@ impl Vk {
             match geo {
                 Geo::Placed(verts) => {
                     pd.cmd_push_descriptor_set(cb, vk::PipelineBindPoint::GRAPHICS, self.playout, 0, &writes);
-                    d.cmd_push_constants(cb, self.playout, vk::ShaderStageFlags::FRAGMENT, 0, &ns.to_le_bytes());
+                    d.cmd_push_constants(cb, self.playout, vk::ShaderStageFlags::FRAGMENT, 0, pcb);
                     d.cmd_bind_vertex_buffers(cb, 0, &[self.vbuf.buf], &[voff]);
                     d.cmd_draw(cb, verts.len() as u32, 1, 0, 0);
                 }
@@ -2918,7 +2974,7 @@ impl Vk {
                     // set 1 (único, dinâmico) com os deslocamentos deste draw; set 0 empurrado
                     d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::GRAPHICS, g.playout, 1, &[g.set], &vs_offs);
                     pd.cmd_push_descriptor_set(cb, vk::PipelineBindPoint::GRAPHICS, g.playout, 0, &writes);
-                    d.cmd_push_constants(cb, g.playout, vk::ShaderStageFlags::FRAGMENT, 0, &ns.to_le_bytes());
+                    d.cmd_push_constants(cb, g.playout, vk::ShaderStageFlags::FRAGMENT, 0, pcb);
                     d.cmd_bind_index_buffer(cb, g.ibuf.buf, ioff, vk::IndexType::UINT32);
                     d.cmd_draw_indexed(cb, dr.indices.len() as u32, 1, 0, 0, 0);
                 }

@@ -25,7 +25,8 @@ layout(set = 0, binding = 0, std140) uniform Draw {
 
 // Fator da resolução interna do alvo em que este draw está sendo gravado (1 = nativo; N na "sombra" N×, vulkan.rs
 // hires): coordenadas de tela do PICA = gl_FragCoord / n.
-layout(push_constant) uniform PC { uint n; } pc;
+// Widescreen (G3): na sombra mais larga, a linha y do alvo foi para y·ky + oy (vulkan.rs `larga_ymap`); ky = 0 = sem.
+layout(push_constant) uniform PC { uint n; float ky; float oy; } pc;
 
 layout(set = 0, binding = 1) uniform sampler2D t0;
 layout(set = 0, binding = 2) uniform sampler2D t1;
@@ -309,6 +310,7 @@ void main() {
     // scissor de exclusão (modo 1): descarta dentro do retângulo
     if ((flags & F_SCISSOR_EXCLUDE) != 0u) {
         uvec2 p = uvec2(gl_FragCoord.xy) / pc.n;
+        if (pc.ky != 0.0) p.y = uint(max(gl_FragCoord.y - pc.oy, 0.0) / pc.ky);
         if (p.x >= u.scissor.x && p.x <= u.scissor.z && p.y >= u.scissor.y && p.y <= u.scissor.w) discard;
     }
 

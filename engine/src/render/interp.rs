@@ -24,8 +24,16 @@
 //! o texto da HUD (atlas reescrito pela CPU) saía embaralhado com a versão do quadro seguinte. As versões dos quadros
 //! capturados ficam pinadas (`Vk::tex_pinned`); se mesmo assim faltar alguma, o quadro não é interpolado.
 //! Desenhos sem teste de profundidade (HUD/2D) usam o shading do quadro novo, sem lerp (`YW_INTERP_HUD=1` volta ao lerp).
+//!
+//! **Etiquetas do jogo (G1, `hle/etiquetas.rs`).** Os draws da cena 3D chegam com a identidade dada pelo próprio jogo
+//! (objeto, primitiva, ocorrência, camada) e a geração de corte da câmera. Quando os dois quadros têm etiquetas, os
+//! draws etiquetados pareiam por IGUALDADE de etiqueta (mesmo programa de vértice; repetidas pareiam em ordem) — sem
+//! janela nem distância —, os sem etiqueta (HUD, céu, efeitos) seguem na heurística entre si, e o corte de cena vem só
+//! da câmera (geração de corte diferente) ou de clear no meio do quadro; o critério 70 %/20 % fica para os quadros sem
+//! etiquetas. Quadro com lista de etiquetas inconsistente usa só a heurística. `YW_INTERP_TAGS=0` = só a heurística.
 
 use super::*;
+use crate::hle::etiquetas::{self, EtiqDraw, Etiqueta};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -75,6 +83,10 @@ pub(super) struct Cap {
     pub tex: [Option<TexKey>; 3],
     /// teste de profundidade ligado (`PipeKey::dtest`): sem ele (HUD/2D) o replay não interpola os uniforms
     pub dtest: bool,
+    /// etiqueta do jogo (G1) e geração de corte de câmera; None = draw sem etiqueta (heurística)
+    pub tag: Option<EtiqDraw>,
+    /// hash do código + descritores do programa de vértice (o par por etiqueta exige o mesmo programa)
+    pub prog_h: u64,
 }
 
 /// Os desenhos de um quadro da tela de cima, do clear ao DisplayTransfer.
@@ -91,6 +103,8 @@ pub(super) struct FrameCap {
     clears_d: Vec<(u32, (f32, u32))>,
     /// endereços limpos depois de já terem recebido desenhos (clear no meio do quadro)
     complex_at: Vec<u32>,
+    /// algum desenho veio de uma lista cujas etiquetas foram descartadas (inconsistentes): o quadro não usa etiquetas
+    pub etiq_ruim: bool,
 }
 
 impl FrameCap {
@@ -131,6 +145,20 @@ struct Stats {
     tex_changed: u64,
     /// quadros não interpolados porque alguma textura capturada saiu do cache
     no_tex: u32,
+    /// etiquetas (G1): quadros pareados com etiquetas, pares por etiqueta, pares pela heurística (sem etiqueta),
+    /// desenhos etiquetados sem par no quadro anterior, etiqueta igual com programa diferente, cortes pela câmera,
+    /// quadros com etiquetas descartadas
+    f_tags: u32,
+    by_tag: u64,
+    by_heur: u64,
+    tag_sem_par: u64,
+    tag_prog: u64,
+    cam_cuts: u32,
+    f_ruim: u32,
+    /// quadros com etiquetas que a heurística antiga teria cortado (comparação, `YW_INTERP_STATS`)
+    heur_cuts: u32,
+    /// marca dos contadores do lado do jogo (`etiquetas::N_*`) na última linha
+    marca_jogo: [u64; 7],
 }
 
 #[derive(Default)]
@@ -165,7 +193,7 @@ pub(super) struct Interp {
     busy_ms: f32,
     mids_ms: f32,
     geo: HashMap<u64, Arc<[u8]>>,
-    progs: HashMap<u64, (Arc<Vec<u32>>, Arc<Vec<u32>>)>,
+    progs: HashMap<u64, (Arc<Vec<u32>>, Arc<Vec<u32>>, u64)>,
     st: Stats,
     // validação (`YW_INTERP_VALIDATE=1`): capturas do quadro N−1 e as imagens reais de N−1 e N
     prev2: Option<FrameCap>,
@@ -260,7 +288,10 @@ impl Interp {
 
     /// Captura um desenho com o shader de vértice na GPU; `tex` = as versões das texturas que ele usou. Falso = não
     /// capturou (quadro já descartado como complexo).
-    pub fn record(&mut self, ctx: &Ctx, key: PipeKey, aot: Option<usize>, dr: &VsDraw, tex: [Option<TexKey>; 3]) -> bool {
+    pub fn record(&mut self, ctx: &Ctx, key: PipeKey, aot: Option<usize>, dr: &VsDraw, tex: [Option<TexKey>; 3], et: etiquetas::Atual) -> bool {
+        if et.ruim {
+            self.cur.etiq_ruim = true;
+        }
         if self.cur.complex {
             return false;
         }
@@ -281,10 +312,13 @@ impl Interp {
         if self.geo.len() > 1024 {
             self.geo.clear();
         }
-        let (code, desc) = self
+        let (code, desc, prog_h) = self
             .progs
             .entry(dr.prog_gen)
-            .or_insert_with(|| (Arc::new(dr.code.to_vec()), Arc::new(dr.desc.to_vec())))
+            .or_insert_with(|| {
+                let h = h64(&dr.code.iter().chain(dr.desc.iter()).map(|&w| w as u64).collect::<Vec<_>>());
+                (Arc::new(dr.code.to_vec()), Arc::new(dr.desc.to_vec()), h)
+            })
             .clone();
         if self.progs.len() > 256 {
             self.progs.clear();
@@ -315,6 +349,8 @@ impl Interp {
             vhash: vh,
             tex,
             dtest: key.dtest,
+            tag: if etiquetas::ligadas() { et.et.filter(|t| !t.sem_id) } else { None },
+            prog_h,
         });
         true
     }
@@ -490,6 +526,16 @@ pub(super) struct Pairing {
     pub matched: usize,
     pub njumpy: usize,
     pub static_geo: usize,
+    /// o par usou as etiquetas do jogo (os dois quadros têm etiquetas válidas)
+    pub tags: bool,
+    /// pares por etiqueta / pela heurística; desenhos etiquetados sem par no anterior; etiqueta igual com programa
+    /// de vértice diferente (não pareia)
+    pub by_tag: usize,
+    pub by_heur: usize,
+    pub tag_sem_par: usize,
+    pub tag_prog: usize,
+    /// a câmera do jogo cortou entre os dois quadros (geração de corte diferente; só com `tags`)
+    pub cam_cut: bool,
 }
 
 /// Distância entre os uniforms float de dois desenhos (soma de |Δ|; chaves 0/1 e valores não finitos não contam).
@@ -506,20 +552,85 @@ fn shading_dist(a: &VsShading, b: &VsShading) -> f32 {
     d
 }
 
-/// Pareamento em ordem por identidade estrutural (janela de 48 desenhos à frente do primeiro ainda livre). Entre
-/// candidatos de mesma identidade (vários personagens com o mesmo modelo e textura) fica o de uniforms mais próximos:
-/// parear o personagem errado interpolaria a matriz de um com a do outro.
+/// Os dois quadros têm etiquetas do jogo utilizáveis? (ligadas, nenhuma lista descartada, algum desenho etiquetado em
+/// cada um)
+fn tags_ok(prev: &FrameCap, cur: &FrameCap) -> bool {
+    etiquetas::ligadas()
+        && !prev.etiq_ruim
+        && !cur.etiq_ruim
+        && prev.draws.iter().any(|d| d.tag.is_some())
+        && cur.draws.iter().any(|d| d.tag.is_some())
+}
+
+/// Geração de corte de câmera de um quadro (a maior entre os desenhos etiquetados).
+fn corte_de(f: &FrameCap) -> Option<u32> {
+    f.draws.iter().filter_map(|d| d.tag.map(|t| t.corte)).max()
+}
+
+/// Pareamento. Com etiquetas nos dois quadros (`tags_ok`): os desenhos etiquetados pareiam por igualdade de etiqueta
+/// (repetidas em ordem; o programa de vértice tem de ser o mesmo) e os sem etiqueta pela heurística, só entre si.
+/// Sem etiquetas: só a heurística.
 pub(super) fn pair(prev: &FrameCap, cur: &FrameCap) -> Pairing {
+    pair_com(prev, cur, tags_ok(prev, cur))
+}
+
+/// Só a heurística (comparação nas estatísticas).
+fn pair_heur(prev: &FrameCap, cur: &FrameCap) -> Pairing {
+    pair_com(prev, cur, false)
+}
+
+fn pair_com(prev: &FrameCap, cur: &FrameCap, tags: bool) -> Pairing {
+    let mut pr = Pairing {
+        pair: vec![None; cur.draws.len()],
+        jumpy: vec![false; cur.draws.len()],
+        matched: 0,
+        njumpy: 0,
+        static_geo: 0,
+        tags,
+        by_tag: 0,
+        by_heur: 0,
+        tag_sem_par: 0,
+        tag_prog: 0,
+        cam_cut: false,
+    };
     let mut used = vec![false; prev.draws.len()];
+    if tags {
+        pr.cam_cut = corte_de(prev) != corte_de(cur);
+        // etiqueta → desenhos do anterior com ela, em ordem (consumidos da frente)
+        let mut mapa: HashMap<Etiqueta, std::collections::VecDeque<usize>> = HashMap::new();
+        for (j, d) in prev.draws.iter().enumerate() {
+            if let Some(t) = d.tag {
+                mapa.entry(t.et).or_default().push_back(j);
+            }
+        }
+        for (i, c) in cur.draws.iter().enumerate() {
+            let Some(t) = c.tag else { continue };
+            match mapa.get_mut(&t.et).and_then(|q| q.pop_front()) {
+                Some(j) if prev.draws[j].prog_h == c.prog_h && prev.draws[j].shading.misc[1] == c.shading.misc[1] => {
+                    used[j] = true;
+                    pr.pair[i] = Some(j);
+                    pr.by_tag += 1;
+                }
+                Some(_) => pr.tag_prog += 1,
+                None => pr.tag_sem_par += 1,
+            }
+        }
+    }
+    // heurística: em ordem por identidade estrutural (janela de 48 desenhos à frente do primeiro ainda livre). Entre
+    // candidatos de mesma identidade (vários personagens com o mesmo modelo e textura) fica o de uniforms mais
+    // próximos: parear o personagem errado interpolaria a matriz de um com a do outro. Com etiquetas, só os desenhos
+    // sem etiqueta dos dois quadros entram aqui.
+    let livre = |d: &Cap| !tags || d.tag.is_none();
+    let cand: Vec<usize> = (0..prev.draws.len()).filter(|&j| livre(&prev.draws[j])).collect();
     let mut first = 0usize;
-    let mut pr = Pairing { pair: vec![None; cur.draws.len()], jumpy: vec![false; cur.draws.len()], matched: 0, njumpy: 0, static_geo: 0 };
-    for (i, c) in cur.draws.iter().enumerate() {
-        while first < used.len() && used[first] {
+    for c in cur.draws.iter().enumerate().filter(|(_, c)| livre(c)) {
+        let (i, c) = c;
+        while first < cand.len() && used[cand[first]] {
             first += 1;
         }
-        let hi = prev.draws.len().min(first + 48);
+        let hi = cand.len().min(first + 48);
         let mut best: Option<(usize, f32)> = None;
-        for j in first..hi {
+        for &j in &cand[first..hi] {
             if used[j] || prev.draws[j].skey != c.skey {
                 continue;
             }
@@ -531,28 +642,38 @@ pub(super) fn pair(prev: &FrameCap, cur: &FrameCap) -> Pairing {
         if let Some((j, _)) = best {
             used[j] = true;
             pr.pair[i] = Some(j);
-            pr.matched += 1;
-            if prev.draws[j].vhash == c.vhash {
-                pr.static_geo += 1;
-            }
-            if jumpy(&prev.draws[j].shading, &c.shading) {
-                pr.jumpy[i] = true;
-                pr.njumpy += 1;
-            }
+            pr.by_heur += 1;
+        }
+    }
+    for (i, c) in cur.draws.iter().enumerate() {
+        let Some(j) = pr.pair[i] else { continue };
+        pr.matched += 1;
+        if prev.draws[j].vhash == c.vhash {
+            pr.static_geo += 1;
+        }
+        if jumpy(&prev.draws[j].shading, &c.shading) {
+            pr.jumpy[i] = true;
+            pr.njumpy += 1;
         }
     }
     pr
 }
 
-/// O par de quadros pode ser interpolado? (sem clear no meio, começa com clear de cor e de profundidade, ≥ 70 % dos
-/// desenhos pareados e ≤ 20 % deles com salto — senão é corte de cena e vale o quadro real)
+/// O par de quadros pode ser interpolado? (sem clear no meio, começa com clear de cor e de profundidade e não é corte
+/// de cena). Corte de cena: com etiquetas, só o aviso da câmera do jogo; sem etiquetas, < 70 % dos desenhos pareados
+/// ou > 20 % deles com salto.
 fn usable(prev: &FrameCap, cur: &FrameCap, pr: &Pairing) -> bool {
     !cur.complex
         && !prev.complex
         && cur.init_color.is_some()
         && cur.init_depth.is_some()
-        && pr.matched * 10 >= cur.draws.len() * 7
-        && pr.njumpy * 5 <= pr.matched
+        && if pr.tags { !pr.cam_cut } else { usable_heur(cur, pr) }
+}
+
+/// O critério antigo de corte de cena (quadros sem etiquetas; `YW_INTERP_STATS` também o mede nos com etiquetas, para
+/// comparar).
+fn usable_heur(cur: &FrameCap, pr: &Pairing) -> bool {
+    pr.matched * 10 >= cur.draws.len() * 7 && pr.njumpy * 5 <= pr.matched
 }
 
 impl Vk {
@@ -772,6 +893,29 @@ impl Vk {
             st.dyn_geo += (pr.matched - pr.static_geo) as u64;
             st.jumpy += pr.njumpy as u64;
             st.gpu_frame_ms += self.ip.gpu_frame_ms as f64;
+            st.by_tag += pr.by_tag as u64;
+            st.by_heur += pr.by_heur as u64;
+            st.tag_sem_par += pr.tag_sem_par as u64;
+            st.tag_prog += pr.tag_prog as u64;
+            if pr.tags {
+                st.f_tags += 1;
+                // o que a heurística antiga diria deste par (só com `YW_INTERP_STATS`, para comparar os cortes)
+                if stats_enabled() && !usable_heur(cur, &pair_heur(prev, cur)) {
+                    st.heur_cuts += 1;
+                    if !pr.cam_cut && etiquetas::log_on() {
+                        eprintln!("[interp-etiq] a heurística cortaria aqui (q={}), a câmera não", crate::hle::VBLANKS.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+            }
+            if pr.cam_cut {
+                st.cam_cuts += 1;
+                if etiquetas::log_on() {
+                    eprintln!("[interp-etiq] corte pela câmera (q={})", crate::hle::VBLANKS.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+            if prev.etiq_ruim || cur.etiq_ruim {
+                st.f_ruim += 1;
+            }
         }
         let usable = usable(prev, cur, &pr);
         if !usable {
@@ -799,7 +943,26 @@ impl Vk {
                 s.tex_changed,
                 s.no_tex
             );
-            self.ip.st = Stats::default();
+            if etiquetas::ligadas() {
+                use std::sync::atomic::Ordering::Relaxed;
+                let agora = [
+                    etiquetas::N_ETIQ.load(Relaxed),
+                    etiquetas::N_SEM_OBJ.load(Relaxed),
+                    etiquetas::N_CASADAS.load(Relaxed),
+                    etiquetas::N_DESCARTADAS.load(Relaxed),
+                    etiquetas::N_LISTAS_RUINS.load(Relaxed),
+                    etiquetas::N_CORTES_CAM.load(Relaxed),
+                    etiquetas::N_PILHA.load(Relaxed),
+                ];
+                let d: Vec<u64> = agora.iter().zip(s.marca_jogo.iter()).map(|(a, b)| a - b).collect();
+                eprintln!(
+                    "[interp-etiq] {} de {} quadros com etiquetas · pares por etiqueta {} · pela heurística {} · etiquetados sem par {} · etiqueta igual e programa diferente {} · cortes pela câmera {} (a heurística cortaria {}) · quadros com etiquetas descartadas {} · jogo: etiquetas {} (casadas com o PICA {}; sem nó, matriz na pilha {}), draws sem etiqueta {}, perdidas {}, listas inconsistentes {}, cortes de câmera {}",
+                    s.f_tags, s.frames, s.by_tag, s.by_heur, s.tag_sem_par, s.tag_prog, s.cam_cuts, s.heur_cuts, s.f_ruim, d[0], d[2], d[6], d[1], d[3], d[4], d[5]
+                );
+                self.ip.st = Stats { marca_jogo: agora, ..Stats::default() };
+            } else {
+                self.ip.st = Stats::default();
+            }
         }
         if target == 0 || !usable || self.ip.period <= 0.0 {
             return Ok(None);
@@ -925,7 +1088,8 @@ impl Vk {
         let n = self.hr.scale;
         let c0 = &cur.draws[0].ctx;
         let (w, h) = (c0.width, c0.height_m1 + 1);
-        let (iw, ih) = (w * n, h * n);
+        // altura = a da sombra (widescreen da G3: mais larga que 400·N na tela de cima)
+        let (iw, ih) = (w * n, self.shadow_h_for(h));
         self.begin()?;
         if self.hr.rimg.as_ref().is_none_or(|r| (r.0, r.1) != (iw, ih)) {
             if let Some((_, _, c, d)) = self.hr.rimg.take() {
@@ -953,7 +1117,7 @@ impl Vk {
         let r = self.hr.rimg.as_ref().unwrap();
         let ck = SurfKey { addr: 0xFFFE_0000, w, h, fmt: c0.color_fmt, depth: false };
         let dk = SurfKey { addr: 0xFFFE_8000, w, h, fmt: c0.depth_fmt, depth: true };
-        Ok(hires::ReplayTarget { ck, dk, cview: r.2.view, dview: r.3.view, cimage: r.2.image, dimage: r.3.image, n })
+        Ok(hires::ReplayTarget { ck, dk, cview: r.2.view, dview: r.3.view, cimage: r.2.image, dimage: r.3.image, n, h: ih })
     }
 
     /// Grava um re-render (α) no lote aberto: fecha a passada da sombra, barreira (o present anterior lê o alvo), clear
@@ -1112,5 +1276,105 @@ mod testes {
                 assert_eq!(vidro.f[r], parede.f[r], "linha {r} (α {t}): a geometria interpola como a da parede");
             }
         }
+    }
+
+    fn ctx_teste() -> Ctx {
+        Ctx {
+            color_addr: 0x1f00_0000,
+            depth_addr: 0x1f10_0000,
+            width: 240,
+            height_m1: 399,
+            color_fmt: 0,
+            depth_fmt: 3,
+            vp: [0.0; 4],
+            zscale: 0.0,
+            zoffset: 0.0,
+            wbuffer: false,
+            cull: 0,
+            scissor: (0, [0; 4]),
+            tex: [None, None, None],
+            tex2_uses_tc1: false,
+            stages: Default::default(),
+            buffer_color: [0; 4],
+            buffer_update: 0,
+            lighting: false,
+            alpha_test: (false, 0, 0),
+            stencil: (false, 0, 0, 0, 0, [0; 3]),
+            depth_test: true,
+            depth_func: 0,
+            depth_write: true,
+            color_mask: 0xf,
+            color_read: true,
+            color_write: true,
+            depth_read: true,
+            depth_rw: true,
+            blend: false,
+            blend_eq: (0, 0),
+            blend_fac: [0; 4],
+            blend_color: [0; 4],
+            logic_op: 0,
+            larga: 0,
+            ancora: 0.0,
+        }
+    }
+
+    /// Desenho de teste: `x` = translação da "matriz de mundo" (c4.w), `obj` = etiqueta (0 = sem), `corte` = geração.
+    fn cap(skey: u64, x: f32, obj: u32, corte: u32) -> Cap {
+        let mut sh = rot_z(0.0, 1.0, [x, 0.0, 0.0]);
+        sh.misc[1] = 7;
+        Cap {
+            ctx: ctx_teste(),
+            shading: Box::new(sh),
+            spans: Vec::new(),
+            data: Vec::new(),
+            indices: Vec::new(),
+            prog_gen: 1,
+            code: Arc::new(Vec::new()),
+            desc: Arc::new(Vec::new()),
+            skey,
+            vhash: 0,
+            tex: [None; 3],
+            dtest: true,
+            tag: (obj != 0).then_some(EtiqDraw { et: Etiqueta { obj, malha: 0x1442_0000, prim: 0x1443_0000, sub: 0, origem: 0x32547c, ancora: 0 }, corte, grupo: 0, sem_id: false }),
+            prog_h: 5,
+        }
+    }
+
+    fn quadro(d: Vec<Cap>) -> FrameCap {
+        FrameCap { draws: d, init_color: Some([0.0; 4]), init_depth: Some((1.0, 0)), ..Default::default() }
+    }
+
+    /// Dois personagens com o mesmo modelo (mesma identidade estrutural) que trocam de ordem na lista e se cruzam: a
+    /// heurística (menor distância) pareia o personagem errado; a etiqueta do jogo pareia certo.
+    #[test]
+    fn etiqueta_pareia_pelo_objeto() {
+        if !etiquetas::ligadas() {
+            return;
+        }
+        let prev = quadro(vec![cap(1, 0.0, 0xa0, 3), cap(1, 10.0, 0xb0, 3), cap(9, 0.0, 0, 3)]);
+        // A anda 0 → 6, B anda 10 → 4 (se cruzaram) e a ordem dos draws trocou
+        let cur = quadro(vec![cap(1, 4.0, 0xb0, 3), cap(1, 6.0, 0xa0, 3), cap(9, 0.0, 0, 3)]);
+        let pr = pair(&prev, &cur);
+        assert!(pr.tags && !pr.cam_cut);
+        assert_eq!(pr.pair, vec![Some(1), Some(0), Some(2)]);
+        assert_eq!((pr.by_tag, pr.by_heur, pr.tag_sem_par), (2, 1, 0));
+        assert!(usable(&prev, &cur, &pr));
+        let ph = pair_heur(&prev, &cur);
+        assert_eq!(ph.pair[0], Some(0), "a heurística pega o mais próximo (o personagem errado)");
+        // corte de câmera: geração diferente
+        let cur2 = quadro(vec![cap(1, 4.0, 0xb0, 4), cap(1, 6.0, 0xa0, 4)]);
+        let pr2 = pair(&prev, &cur2);
+        assert!(pr2.cam_cut && !usable(&prev, &cur2, &pr2));
+        // objeto novo: sem par (desenhado na pose nova), e programa diferente não pareia
+        let mut c3 = cap(1, 4.0, 0xa0, 3);
+        c3.prog_h = 6;
+        let cur3 = quadro(vec![cap(1, 1.0, 0xc0, 3), c3]);
+        let pr3 = pair(&prev, &cur3);
+        assert_eq!(pr3.pair, vec![None, None]);
+        assert_eq!((pr3.tag_sem_par, pr3.tag_prog), (1, 1));
+        // lista com etiquetas descartadas: só a heurística
+        let mut cur4 = quadro(vec![cap(1, 4.0, 0xb0, 3), cap(1, 6.0, 0xa0, 3)]);
+        cur4.etiq_ruim = true;
+        assert!(!pair(&prev, &cur4).tags);
     }
 }
